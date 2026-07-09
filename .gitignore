@@ -1,0 +1,26 @@
+# Rust
+/target/
+Cargo.lock.backup
+
+# Build artifacts
+*.rlib
+*.rmeta
+*.profraw
+*.profdata
+
+# Editor and OS files
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log
+
+# Misc temp files
+*.tmp
