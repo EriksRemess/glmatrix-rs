@@ -48,6 +48,18 @@ Then run it:
 glmatrix-rs
 ```
 
+Desktop integration:
+
+```sh
+install -Dm644 glmatrix-rs.desktop "$HOME/.local/share/applications/glmatrix-rs.desktop"
+```
+
+Optional system-wide install:
+
+```sh
+sudo install -Dm644 glmatrix-rs.desktop /usr/share/applications/glmatrix-rs.desktop
+```
+
 ## Run From Source
 
 ```sh

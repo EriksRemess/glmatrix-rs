@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=GLMatrix in Rust
+Comment=Matrix-style animated screensaver
+Exec=glmatrix-rs
+Terminal=false
+StartupNotify=false
+Categories=Utility;Graphics;Screensaver;
+Keywords=matrix;screensaver;opengl;wayland;
+Icon=utilities-terminal
