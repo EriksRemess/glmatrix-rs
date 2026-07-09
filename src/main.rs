@@ -249,6 +249,7 @@ Options:
 
 Controls:
   Esc or q             quit
+  F                    toggle fullscreen
   left mouse button    pause strip motion while held
   click + drag         move the window
   drag window edge     resize the window
@@ -2312,6 +2313,7 @@ const WL_POINTER_BUTTON_STATE_PRESSED: u32 = 1;
 const WL_POINTER_BUTTON_STATE_RELEASED: u32 = 0;
 const KEY_ESC: u32 = 1;
 const KEY_Q: u32 = 16;
+const KEY_F: u32 = 33;
 const BTN_LEFT: u32 = 0x110;
 
 static REGISTRY_LISTENER: wayland::WlRegistryListener = wayland::WlRegistryListener {
@@ -2550,8 +2552,15 @@ unsafe extern "C" fn keyboard_key(
     key: u32,
     state_value: u32,
 ) {
-    if state_value == WL_KEYBOARD_KEY_STATE_PRESSED && (key == KEY_ESC || key == KEY_Q) {
-        (*(data.cast::<ClientState>())).running = false;
+    if state_value == WL_KEYBOARD_KEY_STATE_PRESSED {
+        let state = &mut *(data.cast::<ClientState>());
+        if key == KEY_ESC || key == KEY_Q {
+            state.running = false;
+            return;
+        }
+        if key == KEY_F {
+            state.toggle_fullscreen();
+        }
     }
 }
 

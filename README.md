@@ -79,6 +79,7 @@ Controls:
 
 ```text
 Esc or q             quit
+F                    toggle fullscreen
 left mouse button    pause strip motion while held
 click + drag         move the window
 drag window edge     resize the window
