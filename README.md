@@ -34,7 +34,21 @@ and the matrix/binary/decimal/hex/DNA glyph modes. Windowing and OpenGL are
 provided through small manual Wayland/EGL/OpenGL FFI bindings instead of
 crates. There is no X11 support.
 
-## Build and Run
+## Install
+
+Install from crates.io:
+
+```sh
+cargo install glmatrix-rs
+```
+
+Then run it:
+
+```sh
+glmatrix-rs
+```
+
+## Run From Source
 
 ```sh
 cargo run --release
