@@ -1,5 +1,7 @@
 # glmatrix-rs
 
+![GLMatrix in Rust running on Wayland](./screenshot.png)
+
 ## Origin
 
 This project is a Wayland-native Rust port of the XScreenSaver GLMatrix hack from:
