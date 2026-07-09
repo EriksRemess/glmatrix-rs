@@ -1,6 +1,7 @@
 [package]
 name = "glmatrix-rs"
 version = "0.1.0"
+description = "A Wayland-native, dependency-free Rust port of xscreensaver's GLMatrix hack."
 edition = "2021"
 build = "build.rs"
 license = "MIT"
