@@ -82,6 +82,7 @@ Useful options:
 -waves / +waves   enable/disable brightness waves
 -rotate / +rotate enable/disable camera auto-rotation
 -texture / +texture enable/disable textured glyphs
+-flip / +flip     enable/disable glyph mirroring (default: disabled)
 -wireframe        draw glyph outlines
 -width N          initial window width, default 1280
 -height N         initial window height, default 720
@@ -92,6 +93,7 @@ Controls:
 ```text
 Esc or q             quit
 F                    toggle fullscreen
+Backspace or Delete  drop rain out of view, then restart
 left mouse button    pause strip motion while held
 click + drag         move the window
 drag window edge     resize the window

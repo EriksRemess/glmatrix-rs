@@ -8,8 +8,10 @@ use std::ptr;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod kana;
+
 const CHAR_COLS: usize = 16;
-const CHAR_ROWS: usize = 13;
+const CHAR_ROWS: usize = 19;
 const REAL_CHAR_ROWS: usize = CHAR_ROWS - 2;
 const GRID_SIZE: usize = 70;
 const GRID_DEPTH: f32 = 35.0;
@@ -23,11 +25,30 @@ const RESIZE_GRAB_MARGIN: f64 = 12.0;
 const MOVE_DRAG_THRESHOLD: f64 = 5.0;
 const DOUBLE_CLICK_MS: u32 = 350;
 const DOUBLE_CLICK_DISTANCE: f64 = 10.0;
+const KEY_BACKSPACE: u32 = 14;
+const KEY_DELETE: u32 = 111;
 
-const MATRIX_ENCODING: [i32; 26] = [
+const ORIGINAL_MATRIX_ENCODING: [i32; 26] = [
     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170,
     171, 172, 173, 174, 175,
 ];
+const KANA_GLYPH_START: usize = 176;
+const MATRIX_ENCODING: [i32; 118] = matrix_encoding();
+
+const fn matrix_encoding() -> [i32; 118] {
+    let mut encoding = [0; 118];
+    let mut i = 0;
+    while i < ORIGINAL_MATRIX_ENCODING.len() {
+        encoding[i] = ORIGINAL_MATRIX_ENCODING[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < kana::PATTERNS.len() {
+        encoding[i + j] = (KANA_GLYPH_START + j) as i32;
+        j += 1;
+    }
+    encoding
+}
 const DECIMAL_ENCODING: [i32; 10] = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25];
 const HEX_ENCODING: [i32; 16] = [
     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 33, 34, 35, 36, 37, 38,
@@ -127,6 +148,7 @@ struct Options {
     do_waves: bool,
     do_rotate: bool,
     do_texture: bool,
+    flip_texture: Option<bool>,
     wireframe: bool,
     mode: GlyphMode,
     width: u32,
@@ -144,6 +166,7 @@ impl Options {
             do_waves: true,
             do_rotate: true,
             do_texture: true,
+            flip_texture: Some(false),
             wireframe: false,
             mode: GlyphMode::Matrix,
             width: 1280,
@@ -187,6 +210,8 @@ impl Options {
                 "+rotate" => options.do_rotate = false,
                 "-texture" | "--texture" => options.do_texture = true,
                 "+texture" => options.do_texture = false,
+                "-flip" | "--flip" => options.flip_texture = Some(true),
+                "+flip" | "--no-flip" => options.flip_texture = Some(false),
                 "-wireframe" | "--wireframe" => options.wireframe = true,
                 "+wireframe" => options.wireframe = false,
                 "-width" | "--width" => {
@@ -244,6 +269,7 @@ Options:
   -waves / +waves      enable/disable brightness waves
   -rotate / +rotate    enable/disable camera auto-rotation
   -texture / +texture  enable/disable textured glyphs
+  -flip / +flip        enable/disable glyph mirroring (default: disabled)
   -wireframe           draw glyph outlines
   -width N             initial window width, default 1280
   -height N            initial window height, default 720
@@ -251,6 +277,7 @@ Options:
 Controls:
   Esc or q             quit
   F                    toggle fullscreen
+  Backspace or Delete  drop rain out of view, then restart
   left mouse button    pause strip motion while held
   click + drag         move the window
   drag window edge     resize the window
@@ -428,7 +455,9 @@ impl Matrix {
     }
 
     fn load_texture(&mut self) {
-        let atlas = make_texture_atlas(self.options.mode.flips_texture());
+        let atlas = make_texture_atlas(
+            self.options.flip_texture.unwrap_or_else(|| self.options.mode.flips_texture()),
+        );
         self.real_char_rows = atlas.real_rows as i32;
         self.tex_char_width = atlas.cell as f32 / atlas.width as f32;
         self.tex_char_height = atlas.cell as f32 / atlas.height as f32;
@@ -575,6 +604,15 @@ impl Matrix {
             return;
         }
 
+        if self.strips[index].dy < 0.0 {
+            let strip = &mut self.strips[index];
+            strip.y += strip.dy;
+            if strip.y < -(GRID_SIZE as f32) {
+                self.strips[index] = self.random_strip(false);
+            }
+            return;
+        }
+
         let mut reset = false;
         {
             let strip = &mut self.strips[index];
@@ -637,6 +675,11 @@ impl Matrix {
     }
 
     fn draw_frame(&mut self, window: &WaylandWindow) {
+        if window.state.erase_requested.replace(false) {
+            for strip in &mut self.strips {
+                strip.dy = -(0.6 + self.rng.frand(0.6)) * self.options.speed;
+            }
+        }
         unsafe {
             gl::glClear(gl::GL_COLOR_BUFFER_BIT | gl::GL_DEPTH_BUFFER_BIT);
             gl::glPushMatrix();
@@ -997,7 +1040,16 @@ fn fixed_to_f64(value: wayland::WlFixed) -> f64 {
 }
 
 fn random_visible_glyph(rng: &mut Rng, glyph_map: &[i32]) -> i32 {
-    glyph_map[rng.usize(glyph_map.len())] + 1
+    let glyphs = if glyph_map.len() == MATRIX_ENCODING.len() {
+        match rng.usize(3) {
+            0 => &glyph_map[..10],
+            1 => &glyph_map[10..ORIGINAL_MATRIX_ENCODING.len()],
+            _ => &glyph_map[ORIGINAL_MATRIX_ENCODING.len()..],
+        }
+    } else {
+        glyph_map
+    };
+    glyphs[rng.usize(glyphs.len())] + 1
 }
 
 struct TextureAtlas {
@@ -1011,7 +1063,7 @@ struct TextureAtlas {
 fn make_texture_atlas(flip: bool) -> TextureAtlas {
     let cell = 32;
     let width = CHAR_COLS * cell;
-    let height = 512;
+    let height = (CHAR_ROWS * cell).next_power_of_two();
     let mut atlas = TextureAtlas {
         width,
         height,
@@ -1032,6 +1084,19 @@ fn draw_atlas_glyph(atlas: &mut TextureAtlas, glyph: usize, flip: bool) {
     let row = glyph / CHAR_COLS;
     let base_x = col * atlas.cell;
     let base_y = (atlas.real_rows - row - 1) * atlas.cell;
+
+    if let Some(pattern) = glyph.checked_sub(KANA_GLYPH_START)
+        .and_then(|index| kana::PATTERNS.get(index))
+    {
+        for (y, bits) in pattern.iter().enumerate() {
+            for x in 0..16 {
+                if bits & (1 << (15 - x)) != 0 {
+                    draw_cell_rect(atlas, base_x, base_y, x * 2, (15 - y) * 2, 2, 2, 255, flip);
+                }
+            }
+        }
+        return;
+    }
 
     if let Some(ch) = ascii_char_for_glyph(glyph) {
         if ch == ' ' {
@@ -1531,6 +1596,7 @@ struct ClientState {
     last_mouse_activity: Instant,
     titlebar_last_update: Cell<Instant>,
     titlebar_opacity: Cell<f32>,
+    erase_requested: Cell<bool>,
     decoration_mode: u32,
     pointer_x: f64,
     pointer_y: f64,
@@ -1573,6 +1639,7 @@ impl ClientState {
             last_mouse_activity: Instant::now(),
             titlebar_last_update: Cell::new(Instant::now()),
             titlebar_opacity: Cell::new(1.0),
+            erase_requested: Cell::new(false),
             decoration_mode: ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE,
             pointer_x: 0.0,
             pointer_y: 0.0,
@@ -2613,6 +2680,9 @@ unsafe extern "C" fn keyboard_key(
         }
         if key == KEY_F {
             state.toggle_fullscreen();
+        }
+        if key == KEY_BACKSPACE || key == KEY_DELETE {
+            state.erase_requested.set(true);
         }
     }
 }
