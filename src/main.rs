@@ -11,6 +11,7 @@ use std::ptr;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod cursor;
 mod kana;
 mod keyboard;
 #[cfg(test)]
@@ -31,6 +32,7 @@ const RESIZE_GRAB_MARGIN: f64 = 12.0;
 const MOVE_DRAG_THRESHOLD: f64 = 5.0;
 const DOUBLE_CLICK_MS: u32 = 350;
 const DOUBLE_CLICK_DISTANCE: f64 = 10.0;
+const MAX_WINDOW_DIMENSION: u32 = 16_384;
 
 const ORIGINAL_MATRIX_ENCODING: [i32; 26] = [
     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170,
@@ -252,10 +254,14 @@ fn parse_f32_arg(name: &str, value: Option<String>) -> Result<f32, String> {
 }
 
 fn parse_u32_arg(name: &str, value: Option<String>) -> Result<u32, String> {
-    value
+    let value = value
         .ok_or_else(|| format!("{name} requires a value"))?
-        .parse()
-        .map_err(|_| format!("{name} requires an integer value"))
+        .parse::<u32>()
+        .map_err(|_| format!("{name} requires an integer value"))?;
+    if value > MAX_WINDOW_DIMENSION {
+        return Err(format!("{name} must not exceed {MAX_WINDOW_DIMENSION}"));
+    }
+    Ok(value)
 }
 
 fn print_help() {
@@ -279,8 +285,8 @@ Options:
   -texture / +texture  enable/disable textured glyphs
   -flip / +flip        enable/disable glyph mirroring (default: disabled)
   -wireframe           draw glyph outlines
-  -width N             initial window width, default 1280
-  -height N            initial window height, default 720
+  -width N             initial window width, default 1280, maximum 16384
+  -height N            initial window height, default 720, maximum 16384
 
 Controls:
   Esc or q             quit
@@ -516,12 +522,12 @@ impl Matrix {
     }
 
     fn reshape(&self, width: u32, height: u32) {
-        let mut viewport_height = height.max(1) as i32;
-        let viewport_width = width.max(1) as i32;
+        let mut viewport_height = height.clamp(1, i32::MAX as u32) as i32;
+        let viewport_width = width.clamp(1, i32::MAX as u32) as i32;
         let mut y = 0;
 
-        if viewport_width > viewport_height * 5 {
-            viewport_height = viewport_width * 9 / 16;
+        if i64::from(viewport_width) > i64::from(viewport_height) * 5 {
+            viewport_height = (i64::from(viewport_width) * 9 / 16) as i32;
             y = -viewport_height / 2;
         }
 
@@ -738,6 +744,7 @@ impl Matrix {
         if window.uses_client_decoration() {
             self.draw_client_border(window.size(), window.state.titlebar_alpha());
         }
+        window.state.update_cursor();
 
         unsafe {
             gl::glFinish();
@@ -1601,8 +1608,13 @@ struct ClientState {
     display: *mut wayland::WlDisplay,
     registry: *mut wayland::WlRegistry,
     compositor: *mut wayland::WlCompositor,
+    shm: *mut wayland::WlShm,
+    cursor: Option<cursor::Cursor>,
+    pointer_enter_serial: Option<u32>,
     surface: *mut wayland::WlSurface,
     seat: *mut wayland::WlSeat,
+    seat_global_name: Option<u32>,
+    available_seats: Vec<(u32, u32)>,
     keyboard: *mut wayland::WlKeyboard,
     keyboard_state: Option<keyboard::KeyboardState>,
     pointer: *mut wayland::WlPointer,
@@ -1617,6 +1629,10 @@ struct ClientState {
     running: bool,
     pointer_down: bool,
     fullscreen: bool,
+    pending_fullscreen: bool,
+    requested_fullscreen: Option<bool>,
+    windowed_width: u32,
+    windowed_height: u32,
     focused: bool,
     last_mouse_activity: Instant,
     titlebar_last_update: Cell<Instant>,
@@ -1645,8 +1661,13 @@ impl ClientState {
             display,
             registry: ptr::null_mut(),
             compositor: ptr::null_mut(),
+            shm: ptr::null_mut(),
+            cursor: None,
+            pointer_enter_serial: None,
             surface: ptr::null_mut(),
             seat: ptr::null_mut(),
+            seat_global_name: None,
+            available_seats: Vec::new(),
             keyboard: ptr::null_mut(),
             keyboard_state: None,
             pointer: ptr::null_mut(),
@@ -1661,6 +1682,10 @@ impl ClientState {
             running: true,
             pointer_down: false,
             fullscreen: false,
+            pending_fullscreen: false,
+            requested_fullscreen: None,
+            windowed_width: width,
+            windowed_height: height,
             focused: true,
             last_mouse_activity: Instant::now(),
             titlebar_last_update: Cell::new(Instant::now()),
@@ -1725,17 +1750,70 @@ impl ClientState {
             && self.pointer_y < title.min(self.height as f64)
     }
 
+    fn update_cursor(&self) {
+        if let (Some(cursor), Some(serial)) = (&self.cursor, self.pointer_enter_serial) {
+            unsafe {
+                if self.cursor_should_hide() {
+                    cursor.hide(self.pointer, serial);
+                } else {
+                    cursor.update(self.pointer, serial, self.pointer_on_close_button());
+                }
+            }
+        }
+    }
+
+    fn cursor_should_hide(&self) -> bool {
+        self.fullscreen && self.last_mouse_activity.elapsed() >= Duration::from_millis(1500)
+    }
+
+    unsafe fn release_pointer(&mut self) {
+        release_input_proxy(self.pointer.cast(), 1, 3);
+        self.pointer = ptr::null_mut();
+        self.pointer_enter_serial = None;
+        self.pointer_down = false;
+        self.press_active = false;
+        self.press_serial = 0;
+        self.last_click_time = None;
+    }
+
+    unsafe fn release_keyboard(&mut self) {
+        release_input_proxy(self.keyboard.cast(), 0, 3);
+        self.keyboard = ptr::null_mut();
+        self.keyboard_state = None;
+        self.focused = false;
+    }
+
+    unsafe fn bind_seat(&mut self, registry: *mut wayland::WlRegistry, name: u32, version: u32) {
+        self.seat =
+            registry_bind(registry, name, &wayland::wl_seat_interface, version.min(5)).cast();
+        if !self.seat.is_null() {
+            self.seat_global_name = Some(name);
+            wayland::wl_proxy_add_listener(
+                self.seat.cast(),
+                (&SEAT_LISTENER as *const wayland::WlSeatListener).cast(),
+                (self as *mut ClientState).cast(),
+            );
+        }
+    }
+
     fn resize_edge_at_pointer(&self) -> u32 {
-        if self.fullscreen {
+        if self.fullscreen
+            || !self.pointer_x.is_finite()
+            || !self.pointer_y.is_finite()
+            || self.pointer_x < 0.0
+            || self.pointer_y < 0.0
+            || self.pointer_x >= self.width as f64
+            || self.pointer_y >= self.height as f64
+        {
             return XDG_TOPLEVEL_RESIZE_EDGE_NONE;
         }
 
         let width = self.width as f64;
         let height = self.height as f64;
-        let left = self.pointer_x <= RESIZE_GRAB_MARGIN;
-        let right = self.pointer_x >= width - RESIZE_GRAB_MARGIN;
-        let top = self.pointer_y <= RESIZE_GRAB_MARGIN;
-        let bottom = self.pointer_y >= height - RESIZE_GRAB_MARGIN;
+        let left = self.pointer_x <= RESIZE_GRAB_MARGIN && self.pointer_x < width * 0.5;
+        let right = !left && self.pointer_x >= width - RESIZE_GRAB_MARGIN;
+        let top = self.pointer_y <= RESIZE_GRAB_MARGIN && self.pointer_y < height * 0.5;
+        let bottom = !top && self.pointer_y >= height - RESIZE_GRAB_MARGIN;
 
         let mut edge = XDG_TOPLEVEL_RESIZE_EDGE_NONE;
         if top {
@@ -1769,13 +1847,13 @@ impl ClientState {
             return;
         }
 
-        if self.fullscreen {
-            xdg_toplevel_unset_fullscreen(self.xdg_toplevel);
-            self.fullscreen = false;
-        } else {
+        let fullscreen = !self.requested_fullscreen.unwrap_or(self.fullscreen);
+        if fullscreen {
             xdg_toplevel_set_fullscreen(self.xdg_toplevel);
-            self.fullscreen = true;
+        } else {
+            xdg_toplevel_unset_fullscreen(self.xdg_toplevel);
         }
+        self.requested_fullscreen = Some(fullscreen);
     }
 
     unsafe fn start_interactive_resize(&mut self, serial: u32, edge: u32) {
@@ -1806,6 +1884,16 @@ impl ClientState {
     }
 
     fn apply_configure_size(&mut self) {
+        if !self.fullscreen && self.pending_fullscreen {
+            self.windowed_width = self.width;
+            self.windowed_height = self.height;
+        }
+        self.fullscreen = self.pending_fullscreen;
+        // An older configure can arrive after a newer fullscreen request.
+        // Keep the latest intent until the compositor reports that state.
+        if self.requested_fullscreen == Some(self.fullscreen) {
+            self.requested_fullscreen = None;
+        }
         if self.pending_width == 0 || self.pending_height == 0 {
             return;
         }
@@ -2074,6 +2162,8 @@ impl WaylandWindow {
 impl Drop for WaylandWindow {
     fn drop(&mut self) {
         unsafe {
+            // Cursor buffers and their surface must be released before disconnecting.
+            self.state.cursor.take();
             if !self.egl_display.is_null() {
                 egl::eglMakeCurrent(
                     self.egl_display,
@@ -2094,15 +2184,9 @@ impl Drop for WaylandWindow {
                 wayland_egl::wl_egl_window_destroy(self.state.egl_window);
             }
 
-            if !self.state.keyboard.is_null() {
-                wayland::wl_proxy_destroy(self.state.keyboard.cast());
-            }
-            if !self.state.pointer.is_null() {
-                wayland::wl_proxy_destroy(self.state.pointer.cast());
-            }
-            if !self.state.seat.is_null() {
-                wayland::wl_proxy_destroy(self.state.seat.cast());
-            }
+            self.state.release_keyboard();
+            self.state.release_pointer();
+            release_input_proxy(self.state.seat.cast(), 3, 5);
             if !self.state.toplevel_decoration.is_null() {
                 wayland::wl_proxy_destroy(self.state.toplevel_decoration);
             }
@@ -2123,6 +2207,9 @@ impl Drop for WaylandWindow {
             }
             if !self.state.compositor.is_null() {
                 wayland::wl_proxy_destroy(self.state.compositor.cast());
+            }
+            if !self.state.shm.is_null() {
+                wayland::wl_proxy_destroy(self.state.shm.cast());
             }
             if !self.state.registry.is_null() {
                 wayland::wl_proxy_destroy(self.state.registry.cast());
@@ -2407,6 +2494,18 @@ unsafe fn toplevel_decoration_set_mode(decoration: *mut wayland::WlProxy, mode: 
     );
 }
 
+unsafe fn release_input_proxy(proxy: *mut wayland::WlProxy, opcode: u32, since: u32) {
+    if proxy.is_null() {
+        return;
+    }
+    let version = wayland::wl_proxy_get_version(proxy);
+    if version >= since {
+        wayland::wl_proxy_marshal_flags(proxy, opcode, ptr::null(), version, 1);
+    } else {
+        wayland::wl_proxy_destroy(proxy);
+    }
+}
+
 unsafe fn seat_get_keyboard(seat: *mut wayland::WlSeat) -> *mut wayland::WlKeyboard {
     wayland::wl_proxy_marshal_flags(
         seat.cast(),
@@ -2524,6 +2623,8 @@ unsafe extern "C" fn registry_global(
         let version = version.min(4);
         state.compositor =
             registry_bind(registry, name, &wayland::wl_compositor_interface, version).cast();
+    } else if interface == "wl_shm" {
+        state.shm = registry_bind(registry, name, &wayland::wl_shm_interface, 1).cast();
     } else if interface == "xdg_wm_base" {
         let version = version.min(6);
         state.wm_base = registry_bind(registry, name, state.xdg.wm_base, version);
@@ -2533,13 +2634,10 @@ unsafe extern "C" fn registry_global(
             data,
         );
     } else if interface == "wl_seat" {
-        let version = version.min(5);
-        state.seat = registry_bind(registry, name, &wayland::wl_seat_interface, version).cast();
-        wayland::wl_proxy_add_listener(
-            state.seat.cast(),
-            (&SEAT_LISTENER as *const wayland::WlSeatListener).cast(),
-            data,
-        );
+        state.available_seats.push((name, version));
+        if state.seat.is_null() {
+            state.bind_seat(registry, name, version);
+        }
     } else if interface == "zxdg_decoration_manager_v1" {
         state.decoration_manager =
             registry_bind(registry, name, state.xdg.decoration_manager, version.min(1));
@@ -2547,10 +2645,24 @@ unsafe extern "C" fn registry_global(
 }
 
 unsafe extern "C" fn registry_global_remove(
-    _data: *mut c_void,
-    _registry: *mut wayland::WlRegistry,
-    _name: u32,
+    data: *mut c_void,
+    registry: *mut wayland::WlRegistry,
+    name: u32,
 ) {
+    let state = &mut *(data.cast::<ClientState>());
+    state
+        .available_seats
+        .retain(|&(seat_name, _)| seat_name != name);
+    if state.seat_global_name == Some(name) {
+        state.release_pointer();
+        state.release_keyboard();
+        release_input_proxy(state.seat.cast(), 3, 5);
+        state.seat = ptr::null_mut();
+        state.seat_global_name = None;
+        if let Some(&(name, version)) = state.available_seats.first() {
+            state.bind_seat(registry, name, version);
+        }
+    }
 }
 
 unsafe extern "C" fn xdg_wm_base_ping(
@@ -2570,9 +2682,8 @@ unsafe extern "C" fn xdg_surface_configure(
     xdg_surface_ack_configure(xdg_surface, serial);
     state.apply_configure_size();
     state.configured = true;
-    if !state.surface.is_null() {
-        surface_commit(state.surface);
-    }
+    // EGL commits the resized buffer on the next swap. Committing here would
+    // apply the new configure while the previous buffer is still attached.
 }
 
 unsafe extern "C" fn xdg_toplevel_configure(
@@ -2583,19 +2694,27 @@ unsafe extern "C" fn xdg_toplevel_configure(
     states: *mut wayland::WlArray,
 ) {
     let state = &mut *(data.cast::<ClientState>());
-    if width > 0 {
-        state.pending_width = width as u32;
-    }
-    if height > 0 {
-        state.pending_height = height as u32;
-    }
-
-    state.fullscreen = false;
+    state.pending_fullscreen = false;
     if !states.is_null() && !(*states).data.is_null() {
         let len = (*states).size / mem::size_of::<u32>();
         let values = std::slice::from_raw_parts((*states).data.cast::<u32>(), len);
-        state.fullscreen = values.contains(&XDG_TOPLEVEL_STATE_FULLSCREEN);
+        state.pending_fullscreen = values.contains(&XDG_TOPLEVEL_STATE_FULLSCREEN);
     }
+    let leaving_fullscreen = state.fullscreen && !state.pending_fullscreen;
+    state.pending_width = if width > 0 {
+        width as u32
+    } else if leaving_fullscreen {
+        state.windowed_width
+    } else {
+        state.width
+    };
+    state.pending_height = if height > 0 {
+        height as u32
+    } else if leaving_fullscreen {
+        state.windowed_height
+    } else {
+        state.height
+    };
 }
 
 unsafe extern "C" fn xdg_toplevel_close(data: *mut c_void, _toplevel: *mut wayland::WlProxy) {
@@ -2631,6 +2750,16 @@ unsafe extern "C" fn seat_capabilities(
     capabilities: u32,
 ) {
     let state = &mut *(data.cast::<ClientState>());
+    if seat != state.seat {
+        return;
+    }
+
+    if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) == 0 {
+        state.release_keyboard();
+    }
+    if (capabilities & WL_SEAT_CAPABILITY_POINTER) == 0 {
+        state.release_pointer();
+    }
 
     if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) != 0 && state.keyboard.is_null() {
         state.keyboard = seat_get_keyboard(seat);
@@ -2756,13 +2885,21 @@ unsafe extern "C" fn keyboard_repeat_info(
 
 unsafe extern "C" fn pointer_enter(
     data: *mut c_void,
-    _pointer: *mut wayland::WlPointer,
-    _serial: u32,
+    pointer: *mut wayland::WlPointer,
+    serial: u32,
     _surface: *mut wayland::WlSurface,
     surface_x: wayland::WlFixed,
     surface_y: wayland::WlFixed,
 ) {
-    (*(data.cast::<ClientState>())).update_pointer(surface_x, surface_y);
+    let state = &mut *(data.cast::<ClientState>());
+    state.update_pointer(surface_x, surface_y);
+    state.pointer_enter_serial = Some(serial);
+    if state.cursor.is_none() {
+        state.cursor = cursor::Cursor::new(state.compositor, state.shm);
+    }
+    if let Some(cursor) = &state.cursor {
+        cursor.show(pointer, serial, state.pointer_on_close_button());
+    }
 }
 
 unsafe extern "C" fn pointer_leave(
@@ -2772,6 +2909,7 @@ unsafe extern "C" fn pointer_leave(
     _surface: *mut wayland::WlSurface,
 ) {
     let state = &mut *(data.cast::<ClientState>());
+    state.pointer_enter_serial = None;
     state.pointer_down = false;
     state.press_active = false;
 }
@@ -2788,6 +2926,7 @@ unsafe extern "C" fn pointer_motion(
     if state.pointer_down && state.press_active {
         state.maybe_start_interactive_move();
     }
+    state.update_cursor();
 }
 
 unsafe extern "C" fn pointer_button(
@@ -2798,8 +2937,10 @@ unsafe extern "C" fn pointer_button(
     button: u32,
     state_value: u32,
 ) {
+    let state = &mut *(data.cast::<ClientState>());
+    state.last_mouse_activity = Instant::now();
+    state.update_cursor();
     if button == BTN_LEFT {
-        let state = &mut *(data.cast::<ClientState>());
         if state_value == WL_POINTER_BUTTON_STATE_PRESSED {
             if state.pointer_on_close_button() {
                 state.pointer_down = false;
@@ -2807,7 +2948,6 @@ unsafe extern "C" fn pointer_button(
                 state.running = false;
                 return;
             }
-            state.last_mouse_activity = Instant::now();
             if state.is_double_click(time) {
                 state.pointer_down = false;
                 state.press_active = false;
@@ -2840,12 +2980,15 @@ unsafe extern "C" fn pointer_button(
 }
 
 unsafe extern "C" fn pointer_axis(
-    _data: *mut c_void,
+    data: *mut c_void,
     _pointer: *mut wayland::WlPointer,
     _time: u32,
     _axis: u32,
     _value: wayland::WlFixed,
 ) {
+    let state = &mut *(data.cast::<ClientState>());
+    state.last_mouse_activity = Instant::now();
+    state.update_cursor();
 }
 
 unsafe extern "C" fn pointer_frame(_data: *mut c_void, _pointer: *mut wayland::WlPointer) {}
@@ -3205,6 +3348,10 @@ mod wayland {
         _private: [u8; 0],
     }
     #[repr(C)]
+    pub struct WlShm {
+        _private: [u8; 0],
+    }
+    #[repr(C)]
     pub struct WlSurface {
         _private: [u8; 0],
     }
@@ -3310,6 +3457,7 @@ mod wayland {
     unsafe extern "C" {
         pub static wl_registry_interface: WlInterface;
         pub static wl_compositor_interface: WlInterface;
+        pub static wl_shm_interface: WlInterface;
         pub static wl_surface_interface: WlInterface;
         pub static wl_seat_interface: WlInterface;
         pub static wl_keyboard_interface: WlInterface;

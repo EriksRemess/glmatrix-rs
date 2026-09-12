@@ -35,6 +35,11 @@ provided through small manual Wayland/EGL/OpenGL FFI bindings instead of
 crates. There is no X11 support.
 
 Keyboard shortcuts follow the active keyboard layout through `libxkbcommon`.
+The pointer uses a themed arrow, or a pointing hand over the visible close
+button, through `libwayland-cursor`,
+respecting `XCURSOR_THEME` and `XCURSOR_SIZE` when set.
+In fullscreen, the cursor hides after 1.5 seconds of mouse inactivity and
+reappears on movement, a click, or scrolling.
 Building requires Rust and the development libraries for Wayland, EGL, OpenGL,
 and xkbcommon. On Debian/Ubuntu, install `libwayland-dev libegl-dev libgl-dev
 libxkbcommon-dev`. Runtime installations need the corresponding shared libraries.
@@ -89,8 +94,8 @@ Useful options:
 -texture / +texture enable/disable textured glyphs
 -flip / +flip     enable/disable glyph mirroring (default: disabled)
 -wireframe        draw glyph outlines
--width N          initial window width, default 1280
--height N         initial window height, default 720
+-width N          initial window width, default 1280, maximum 16384
+-height N         initial window height, default 720, maximum 16384
 ```
 
 Controls:

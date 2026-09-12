@@ -32,6 +32,53 @@ fn numeric_arguments_reject_non_finite_values() {
     }
 }
 
+#[test]
+fn fullscreen_cursor_hides_only_when_idle_and_returns_on_activity() {
+    let mut state = ClientState::new(ptr::null_mut(), 1280, 720);
+    state.last_mouse_activity = Instant::now() - Duration::from_secs(2);
+    assert!(
+        !state.cursor_should_hide(),
+        "windowed cursor must stay visible"
+    );
+    state.fullscreen = true;
+    assert!(state.cursor_should_hide());
+    state.update_pointer(256, 256);
+    assert!(
+        !state.cursor_should_hide(),
+        "movement must reveal the cursor"
+    );
+    state.last_mouse_activity = Instant::now() - Duration::from_secs(2);
+    let data = (&mut state as *mut ClientState).cast();
+    unsafe {
+        pointer_button(
+            data,
+            ptr::null_mut(),
+            0,
+            0,
+            0x111,
+            WL_POINTER_BUTTON_STATE_PRESSED,
+        );
+    }
+    assert!(
+        !state.cursor_should_hide(),
+        "right click must reveal the cursor"
+    );
+    state.last_mouse_activity = Instant::now() - Duration::from_secs(2);
+    unsafe {
+        pointer_axis(data, ptr::null_mut(), 0, 0, 256);
+    }
+    assert!(
+        !state.cursor_should_hide(),
+        "scrolling must reveal the cursor"
+    );
+    state.last_mouse_activity = Instant::now() - Duration::from_secs(2);
+    state.fullscreen = false;
+    assert!(
+        !state.cursor_should_hide(),
+        "leaving fullscreen must reveal the cursor"
+    );
+}
+
 fn configure(state: &mut ClientState, width: i32, height: i32, values: &mut [u32]) {
     let mut states = wayland::WlArray {
         size: mem::size_of_val(values),
@@ -331,7 +378,231 @@ fn untextured_and_wireframe_rendering_apply_brightness_and_fog() {
     }
 }
 
+#[test]
+fn window_dimensions_reject_oversized_values() {
+    for name in ["--width", "--height"] {
+        for value in ["16385", "500000000", "2147483648", "4294967295", "-1"] {
+            assert!(
+                parse_u32_arg(name, Some(value.into())).is_err(),
+                "{name} {value}"
+            );
+        }
+        for value in [0, 64, 1280, MAX_WINDOW_DIMENSION] {
+            assert_eq!(parse_u32_arg(name, Some(value.to_string())).unwrap(), value);
+        }
+    }
+}
+
+#[test]
+fn tiny_windows_always_choose_a_valid_resize_edge() {
+    let valid = [0, 1, 2, 4, 5, 6, 8, 9, 10];
+    let mut state = ClientState::new(ptr::null_mut(), 1280, 720);
+    for width in [1, 8, 16, 23, 24, 64, 1280] {
+        for height in [1, 8, 16, 23, 24, 64, 720] {
+            state.width = width;
+            state.height = height;
+            for x in [
+                0.0,
+                width as f64 * 0.25,
+                width as f64 * 0.5,
+                width as f64 - 1.0,
+            ] {
+                for y in [
+                    0.0,
+                    height as f64 * 0.25,
+                    height as f64 * 0.5,
+                    height as f64 - 1.0,
+                ] {
+                    state.pointer_x = x;
+                    state.pointer_y = y;
+                    assert!(
+                        valid.contains(&state.resize_edge_at_pointer()),
+                        "{width}x{height} at {x},{y}"
+                    );
+                }
+            }
+        }
+    }
+    state.width = 1280;
+    state.height = 16;
+    state.pointer_x = 500.0;
+    state.pointer_y = 2.0;
+    assert_eq!(state.resize_edge_at_pointer(), XDG_TOPLEVEL_RESIZE_EDGE_TOP);
+    state.pointer_y = 14.0;
+    assert_eq!(
+        state.resize_edge_at_pointer(),
+        XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM
+    );
+    state.pointer_y = -1.0;
+    assert_eq!(
+        state.resize_edge_at_pointer(),
+        XDG_TOPLEVEL_RESIZE_EDGE_NONE
+    );
+    state.pointer_y = 0.0;
+    state.fullscreen = true;
+    assert_eq!(
+        state.resize_edge_at_pointer(),
+        XDG_TOPLEVEL_RESIZE_EDGE_NONE
+    );
+}
+
+#[test]
+fn fullscreen_restores_saved_size_and_honors_partial_hints() {
+    let mut state = ClientState::new(ptr::null_mut(), 1280, 720);
+    configure(&mut state, 900, 600, &mut []);
+    configure(&mut state, 1920, 1080, &mut [XDG_TOPLEVEL_STATE_FULLSCREEN]);
+    configure(&mut state, 2560, 1440, &mut [XDG_TOPLEVEL_STATE_FULLSCREEN]);
+    configure(&mut state, 0, 0, &mut []);
+    assert_eq!((state.width, state.height), (900, 600));
+    configure(&mut state, 1920, 1080, &mut [XDG_TOPLEVEL_STATE_FULLSCREEN]);
+    configure(&mut state, 1000, 0, &mut []);
+    assert_eq!((state.width, state.height), (1000, 600));
+    configure(&mut state, 1920, 1080, &mut [XDG_TOPLEVEL_STATE_FULLSCREEN]);
+    configure(&mut state, 0, 700, &mut []);
+    assert_eq!((state.width, state.height), (1000, 700));
+}
+
+#[test]
+fn fullscreen_state_waits_for_surface_configure() {
+    let mut state = ClientState::new(ptr::null_mut(), 1280, 720);
+    state.requested_fullscreen = Some(true);
+    let mut value = XDG_TOPLEVEL_STATE_FULLSCREEN;
+    let mut states = wayland::WlArray {
+        size: 4,
+        alloc: 0,
+        data: (&mut value as *mut u32).cast(),
+    };
+    unsafe {
+        xdg_toplevel_configure(
+            (&mut state as *mut ClientState).cast(),
+            ptr::null_mut(),
+            1920,
+            1080,
+            &mut states,
+        );
+    }
+    assert!(!state.fullscreen);
+    assert_eq!((state.width, state.height), (1280, 720));
+    state.apply_configure_size();
+    assert!(state.fullscreen);
+    assert_eq!(state.requested_fullscreen, None);
+    assert_eq!((state.windowed_width, state.windowed_height), (1280, 720));
+}
+
+// An idle socket peer lets libwayland allocate and release real client proxies
+// without opening a desktop window or requiring a running compositor.
+struct InputFixture {
+    state: Box<ClientState>,
+    _peer: std::os::unix::net::UnixStream,
+}
+
+impl InputFixture {
+    fn new() -> Self {
+        use std::os::fd::IntoRawFd;
+        let (client, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        unsafe {
+            let display = wl_display_connect_to_fd(client.into_raw_fd());
+            assert!(!display.is_null());
+            let mut state = Box::new(ClientState::new(display, 1280, 720));
+            state.registry = display_get_registry(display);
+            assert!(!state.registry.is_null());
+            Self { state, _peer: peer }
+        }
+    }
+
+    fn announce(&mut self, name: u32, version: u32) {
+        let data = (self.state.as_mut() as *mut ClientState).cast();
+        unsafe {
+            registry_global(
+                data,
+                self.state.registry,
+                name,
+                c"wl_seat".as_ptr(),
+                version,
+            );
+        }
+    }
+
+    fn capabilities(&mut self, capabilities: u32) {
+        let data = (self.state.as_mut() as *mut ClientState).cast();
+        unsafe {
+            seat_capabilities(data, self.state.seat, capabilities);
+        }
+    }
+}
+
+impl Drop for InputFixture {
+    fn drop(&mut self) {
+        unsafe {
+            self.state.release_pointer();
+            self.state.release_keyboard();
+            release_input_proxy(self.state.seat.cast(), 3, 5);
+            wayland::wl_proxy_destroy(self.state.registry.cast());
+            wayland::wl_display_disconnect(self.state.display);
+        }
+    }
+}
+
+#[test]
+fn input_capabilities_can_be_removed_and_readded() {
+    for version in [2, 5] {
+        let mut fixture = InputFixture::new();
+        fixture.announce(1, version);
+        fixture.capabilities(WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+        assert!(!fixture.state.pointer.is_null());
+        assert!(!fixture.state.keyboard.is_null());
+        fixture.state.keyboard_state =
+            Some(keyboard::KeyboardState::new(KEYMAP.as_bytes()).unwrap());
+        fixture.state.focused = true;
+        fixture.state.pointer_down = true;
+        fixture.state.press_active = true;
+        fixture.state.pointer_enter_serial = Some(123);
+        fixture.state.last_click_time = Some(123);
+        fixture.capabilities(WL_SEAT_CAPABILITY_KEYBOARD);
+        assert!(fixture.state.pointer.is_null());
+        assert!(!fixture.state.pointer_down && !fixture.state.press_active);
+        assert!(fixture.state.pointer_enter_serial.is_none());
+        assert!(fixture.state.last_click_time.is_none());
+        assert!(fixture.state.keyboard_state.is_some());
+        fixture.capabilities(0);
+        assert!(fixture.state.keyboard.is_null());
+        assert!(fixture.state.keyboard_state.is_none());
+        assert!(!fixture.state.focused);
+        fixture.capabilities(WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+        assert!(!fixture.state.pointer.is_null());
+        assert!(!fixture.state.keyboard.is_null());
+    }
+}
+
+#[test]
+fn removing_active_seat_selects_an_available_replacement() {
+    let mut fixture = InputFixture::new();
+    fixture.announce(1, 5);
+    fixture.announce(2, 5);
+    assert_eq!(fixture.state.seat_global_name, Some(1));
+    fixture.capabilities(WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+    let data = (fixture.state.as_mut() as *mut ClientState).cast();
+    unsafe {
+        registry_global_remove(data, fixture.state.registry, 1);
+    }
+    assert_eq!(fixture.state.seat_global_name, Some(2));
+    assert!(fixture.state.pointer.is_null() && fixture.state.keyboard.is_null());
+    fixture.capabilities(WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+    assert!(!fixture.state.pointer.is_null() && !fixture.state.keyboard.is_null());
+    let data = (fixture.state.as_mut() as *mut ClientState).cast();
+    unsafe {
+        registry_global_remove(data, fixture.state.registry, 2);
+    }
+    assert!(fixture.state.seat.is_null());
+    assert_eq!(fixture.state.seat_global_name, None);
+    fixture.announce(3, 5);
+    assert_eq!(fixture.state.seat_global_name, Some(3));
+    fixture.capabilities(WL_SEAT_CAPABILITY_POINTER);
+    assert!(!fixture.state.pointer.is_null());
+}
+
 unsafe extern "C" {
+    fn wl_display_connect_to_fd(fd: c_int) -> *mut wayland::WlDisplay;
     fn eglGetPlatformDisplay(
         platform: u32,
         native_display: *mut c_void,
