@@ -5,5 +5,6 @@ description = "A Wayland-native, dependency-free Rust port of xscreensaver's GLM
 edition = "2021"
 build = "build.rs"
 license = "MIT"
+repository = "https://github.com/EriksRemess/glmatrix-rs"
 
 [dependencies]
