@@ -1,14 +1,20 @@
 use std::cell::Cell;
 use std::env;
 use std::ffi::{CStr, CString};
+use std::fs::File;
 use std::mem;
+use std::os::fd::FromRawFd;
 use std::os::raw::{c_char, c_int, c_long, c_short, c_uint, c_void};
+use std::os::unix::fs::FileExt;
 use std::process;
 use std::ptr;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod kana;
+mod keyboard;
+#[cfg(test)]
+mod tests;
 
 const CHAR_COLS: usize = 16;
 const CHAR_ROWS: usize = 19;
@@ -25,8 +31,6 @@ const RESIZE_GRAB_MARGIN: f64 = 12.0;
 const MOVE_DRAG_THRESHOLD: f64 = 5.0;
 const DOUBLE_CLICK_MS: u32 = 350;
 const DOUBLE_CLICK_DISTANCE: f64 = 10.0;
-const KEY_BACKSPACE: u32 = 14;
-const KEY_DELETE: u32 = 111;
 
 const ORIGINAL_MATRIX_ENCODING: [i32; 26] = [
     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170,
@@ -237,10 +241,14 @@ impl Options {
 }
 
 fn parse_f32_arg(name: &str, value: Option<String>) -> Result<f32, String> {
-    value
+    let value = value
         .ok_or_else(|| format!("{name} requires a value"))?
-        .parse()
-        .map_err(|_| format!("{name} requires a numeric value"))
+        .parse::<f32>()
+        .map_err(|_| format!("{name} requires a numeric value"))?;
+    if !value.is_finite() {
+        return Err(format!("{name} requires a finite numeric value"));
+    }
+    Ok(value)
 }
 
 fn parse_u32_arg(name: &str, value: Option<String>) -> Result<u32, String> {
@@ -456,7 +464,9 @@ impl Matrix {
 
     fn load_texture(&mut self) {
         let atlas = make_texture_atlas(
-            self.options.flip_texture.unwrap_or_else(|| self.options.mode.flips_texture()),
+            self.options
+                .flip_texture
+                .unwrap_or_else(|| self.options.mode.flips_texture()),
         );
         self.real_char_rows = atlas.real_rows as i32;
         self.tex_char_width = atlas.cell as f32 / atlas.width as f32;
@@ -742,6 +752,11 @@ impl Matrix {
         let title = CLIENT_DECORATION_TITLE as f32;
 
         unsafe {
+            let mut viewport = [0; 4];
+            gl::glGetIntegerv(gl::GL_VIEWPORT, viewport.as_mut_ptr());
+            gl::glViewport(0, 0, width as c_int, height as c_int);
+            // Decorations blend over the rain without making the surface transparent.
+            gl::glColorMask(1, 1, 1, 0);
             gl::glDisable(gl::GL_TEXTURE_2D);
             gl::glEnable(gl::GL_BLEND);
             gl::glBlendFunc(gl::GL_SRC_ALPHA, gl::GL_ONE_MINUS_SRC_ALPHA);
@@ -773,7 +788,8 @@ impl Matrix {
 
             let title_scale = 1.0;
             let mut title_text = WINDOW_TITLE_TEXT.to_string();
-            while measure_client_title_width(&title_text, title_scale) > (w - title * 2.0).max(0.0) {
+            while measure_client_title_width(&title_text, title_scale) > (w - title * 2.0).max(0.0)
+            {
                 if title_text.pop().is_none() {
                     break;
                 }
@@ -790,6 +806,8 @@ impl Matrix {
             gl::glMatrixMode(gl::GL_PROJECTION);
             gl::glPopMatrix();
             gl::glMatrixMode(gl::GL_MODELVIEW);
+            gl::glColorMask(1, 1, 1, 1);
+            gl::glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
         }
     }
 
@@ -870,12 +888,12 @@ impl Matrix {
             let ccy = cell / CHAR_COLS as i32;
             cx = ccx as f32 * self.tex_char_width;
             cy = (self.real_char_rows - ccy - 1) as f32 * self.tex_char_height;
+        }
 
-            if self.options.do_fog {
-                let mut depth = z / GRID_DEPTH + 0.5;
-                depth = 0.2 + depth * 0.8;
-                brightness *= depth;
-            }
+        if self.options.do_fog {
+            let mut depth = z / GRID_DEPTH + 0.5;
+            depth = 0.2 + depth * 0.8;
+            brightness *= depth;
         }
 
         if highlight {
@@ -898,7 +916,12 @@ impl Matrix {
         }
 
         unsafe {
-            gl::glColor4f(r, g, b, alpha);
+            if self.options.do_texture {
+                gl::glColor4f(r, g, b, alpha);
+            } else {
+                let brightness = alpha.clamp(0.0, 1.0);
+                gl::glColor4f(r * brightness, g * brightness, b * brightness, 1.0);
+            }
             gl::glBegin(if self.options.wireframe {
                 gl::GL_LINE_LOOP
             } else {
@@ -1001,9 +1024,9 @@ fn draw_client_title_text(text: &str, mut x: f32, y: f32, scale: f32) {
         }
 
         if let Some(pattern) = font_pattern(ch) {
-            for row in 0..7 {
+            for (row, bits) in pattern.iter().enumerate() {
                 for col in 0..5 {
-                    if pattern[row] & (1 << (4 - col)) != 0 {
+                    if bits & (1 << (4 - col)) != 0 {
                         draw_screen_rect(
                             x + col as f32 * scale,
                             y + row as f32 * scale,
@@ -1085,7 +1108,8 @@ fn draw_atlas_glyph(atlas: &mut TextureAtlas, glyph: usize, flip: bool) {
     let base_x = col * atlas.cell;
     let base_y = (atlas.real_rows - row - 1) * atlas.cell;
 
-    if let Some(pattern) = glyph.checked_sub(KANA_GLYPH_START)
+    if let Some(pattern) = glyph
+        .checked_sub(KANA_GLYPH_START)
         .and_then(|index| kana::PATTERNS.get(index))
     {
         for (y, bits) in pattern.iter().enumerate() {
@@ -1580,6 +1604,7 @@ struct ClientState {
     surface: *mut wayland::WlSurface,
     seat: *mut wayland::WlSeat,
     keyboard: *mut wayland::WlKeyboard,
+    keyboard_state: Option<keyboard::KeyboardState>,
     pointer: *mut wayland::WlPointer,
     wm_base: *mut wayland::WlProxy,
     xdg_surface: *mut wayland::WlProxy,
@@ -1623,6 +1648,7 @@ impl ClientState {
             surface: ptr::null_mut(),
             seat: ptr::null_mut(),
             keyboard: ptr::null_mut(),
+            keyboard_state: None,
             pointer: ptr::null_mut(),
             wm_base: ptr::null_mut(),
             xdg_surface: ptr::null_mut(),
@@ -1907,7 +1933,10 @@ impl WaylandWindow {
             xdg_toplevel_set_app_id(state.xdg_toplevel, app_id.as_ptr());
             surface_commit(state.surface);
 
-            while !(*state_ptr).configured {
+            loop {
+                if (*state_ptr).configured {
+                    break;
+                }
                 if wayland::wl_display_dispatch(display) < 0 {
                     wayland::wl_display_disconnect(display);
                     return Err("Wayland dispatch failed while waiting for configure".to_string());
@@ -2427,9 +2456,6 @@ const WL_SEAT_CAPABILITY_KEYBOARD: u32 = 2;
 const WL_KEYBOARD_KEY_STATE_PRESSED: u32 = 1;
 const WL_POINTER_BUTTON_STATE_PRESSED: u32 = 1;
 const WL_POINTER_BUTTON_STATE_RELEASED: u32 = 0;
-const KEY_ESC: u32 = 1;
-const KEY_Q: u32 = 16;
-const KEY_F: u32 = 33;
 const BTN_LEFT: u32 = 0x110;
 
 static REGISTRY_LISTENER: wayland::WlRegistryListener = wayland::WlRegistryListener {
@@ -2557,11 +2583,14 @@ unsafe extern "C" fn xdg_toplevel_configure(
     states: *mut wayland::WlArray,
 ) {
     let state = &mut *(data.cast::<ClientState>());
-    if width > 0 && height > 0 {
+    if width > 0 {
         state.pending_width = width as u32;
+    }
+    if height > 0 {
         state.pending_height = height as u32;
     }
 
+    state.fullscreen = false;
     if !states.is_null() && !(*states).data.is_null() {
         let len = (*states).size / mem::size_of::<u32>();
         let values = std::slice::from_raw_parts((*states).data.cast::<u32>(), len);
@@ -2634,13 +2663,28 @@ unsafe extern "C" fn seat_name(
 }
 
 unsafe extern "C" fn keyboard_keymap(
-    _data: *mut c_void,
+    data: *mut c_void,
     _keyboard: *mut wayland::WlKeyboard,
-    _format: u32,
+    format: u32,
     fd: c_int,
-    _size: u32,
+    size: u32,
 ) {
-    close(fd);
+    let state = &mut *(data.cast::<ClientState>());
+    let file = File::from_raw_fd(fd);
+    state.keyboard_state = None;
+    if format != 1 || size == 0 || size > 16 * 1024 * 1024 {
+        eprintln!("unsupported Wayland keyboard keymap");
+        return;
+    }
+    let mut bytes = vec![0; size as usize];
+    if let Err(error) = file.read_exact_at(&mut bytes, 0) {
+        eprintln!("could not read keyboard keymap: {error}");
+        return;
+    }
+    match keyboard::KeyboardState::new(&bytes) {
+        Ok(keyboard) => state.keyboard_state = Some(keyboard),
+        Err(error) => eprintln!("{error}"),
+    }
 }
 
 unsafe extern "C" fn keyboard_enter(
@@ -2674,28 +2718,32 @@ unsafe extern "C" fn keyboard_key(
 ) {
     if state_value == WL_KEYBOARD_KEY_STATE_PRESSED {
         let state = &mut *(data.cast::<ClientState>());
-        if key == KEY_ESC || key == KEY_Q {
-            state.running = false;
-            return;
-        }
-        if key == KEY_F {
-            state.toggle_fullscreen();
-        }
-        if key == KEY_BACKSPACE || key == KEY_DELETE {
-            state.erase_requested.set(true);
+        let action = state
+            .keyboard_state
+            .as_ref()
+            .and_then(|keyboard| keyboard.action(key));
+        match action {
+            Some(keyboard::Action::Quit) => state.running = false,
+            Some(keyboard::Action::Fullscreen) => state.toggle_fullscreen(),
+            Some(keyboard::Action::DropRain) => state.erase_requested.set(true),
+            None => {}
         }
     }
 }
 
 unsafe extern "C" fn keyboard_modifiers(
-    _data: *mut c_void,
+    data: *mut c_void,
     _keyboard: *mut wayland::WlKeyboard,
     _serial: u32,
-    _mods_depressed: u32,
-    _mods_latched: u32,
-    _mods_locked: u32,
-    _group: u32,
+    mods_depressed: u32,
+    mods_latched: u32,
+    mods_locked: u32,
+    group: u32,
 ) {
+    let state = &mut *(data.cast::<ClientState>());
+    if let Some(keyboard) = &mut state.keyboard_state {
+        keyboard.update_modifiers(mods_depressed, mods_latched, mods_locked, group);
+    }
 }
 
 unsafe extern "C" fn keyboard_repeat_info(
@@ -2885,7 +2933,6 @@ const POLLIN: c_short = 0x0001;
 
 unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: c_uint, timeout: c_int) -> c_int;
-    fn close(fd: c_int) -> c_int;
 }
 
 fn run() -> Result<(), String> {
@@ -2983,6 +3030,7 @@ mod gl {
     pub const GL_TEXTURE_ENV: GLenum = 0x2300;
     pub const GL_TEXTURE_ENV_MODE: GLenum = 0x2200;
     pub const GL_MODULATE: GLenum = 0x2100;
+    pub const GL_VIEWPORT: GLenum = 0x0BA2;
 
     unsafe extern "C" {
         pub fn glBegin(mode: GLenum);
@@ -2991,6 +3039,8 @@ mod gl {
         pub fn glClear(mask: GLbitfield);
         pub fn glClearColor(red: GLfloat, green: GLfloat, blue: GLfloat, alpha: GLfloat);
         pub fn glColor4f(red: GLfloat, green: GLfloat, blue: GLfloat, alpha: GLfloat);
+        pub fn glColorMask(red: u8, green: u8, blue: u8, alpha: u8);
+        pub fn glGetIntegerv(pname: GLenum, data: *mut GLint);
         pub fn glDeleteTextures(n: GLsizei, textures: *const GLuint);
         pub fn glDisable(cap: GLenum);
         pub fn glEnable(cap: GLenum);

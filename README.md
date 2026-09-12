@@ -34,6 +34,11 @@ and the matrix/binary/decimal/hex/DNA glyph modes. Windowing and OpenGL are
 provided through small manual Wayland/EGL/OpenGL FFI bindings instead of
 crates. There is no X11 support.
 
+Keyboard shortcuts follow the active keyboard layout through `libxkbcommon`.
+Building requires Rust and the development libraries for Wayland, EGL, OpenGL,
+and xkbcommon. On Debian/Ubuntu, install `libwayland-dev libegl-dev libgl-dev
+libxkbcommon-dev`. Runtime installations need the corresponding shared libraries.
+
 ## Install
 
 Install from crates.io:
