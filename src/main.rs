@@ -1663,6 +1663,8 @@ struct ClientState {
     fullscreen: bool,
     pending_fullscreen: bool,
     requested_fullscreen: Option<bool>,
+    fullscreen_request_in_flight: Option<bool>,
+    fullscreen_sync: *mut wayland::WlProxy,
     windowed_width: u32,
     windowed_height: u32,
     focused: bool,
@@ -1716,6 +1718,8 @@ impl ClientState {
             fullscreen: false,
             pending_fullscreen: false,
             requested_fullscreen: None,
+            fullscreen_request_in_flight: None,
+            fullscreen_sync: ptr::null_mut(),
             windowed_width: width,
             windowed_height: height,
             focused: true,
@@ -1879,13 +1883,69 @@ impl ClientState {
             return;
         }
 
-        let fullscreen = !self.requested_fullscreen.unwrap_or(self.fullscreen);
+        self.requested_fullscreen = Some(!self.requested_fullscreen.unwrap_or(self.fullscreen));
+    }
+
+    unsafe fn send_pending_fullscreen(&mut self) {
+        if self.xdg_toplevel.is_null() || self.fullscreen_request_in_flight.is_some() {
+            return;
+        }
+        let Some(fullscreen) = self.requested_fullscreen else {
+            return;
+        };
+        if fullscreen == self.fullscreen {
+            self.requested_fullscreen = None;
+            return;
+        }
         if fullscreen {
             xdg_toplevel_set_fullscreen(self.xdg_toplevel);
         } else {
             xdg_toplevel_unset_fullscreen(self.xdg_toplevel);
         }
-        self.requested_fullscreen = Some(fullscreen);
+        self.fullscreen_request_in_flight = Some(fullscreen);
+        // Configure events are not request acknowledgements. The sync callback
+        // marks completion of the preceding request and its resulting events.
+        self.fullscreen_sync = wayland::wl_proxy_marshal_flags(
+            self.display.cast(),
+            0, // wl_display.sync
+            &wayland::wl_callback_interface,
+            1,
+            0,
+            ptr::null_mut::<c_void>(),
+        );
+        if self.fullscreen_sync.is_null()
+            || wayland::wl_proxy_add_listener(
+                self.fullscreen_sync,
+                (&FULLSCREEN_SYNC_LISTENER as *const FullscreenSyncListener).cast(),
+                (self as *mut ClientState).cast(),
+            ) != 0
+        {
+            eprintln!("could not synchronize fullscreen request");
+            self.release_fullscreen_sync();
+            self.running = false;
+        }
+    }
+
+    fn complete_fullscreen_request(&mut self) {
+        if let Some(sent) = self.fullscreen_request_in_flight.take() {
+            if self.requested_fullscreen == Some(sent) {
+                // No different target was queued. Accept the compositor's
+                // final state, including a rejected request.
+                self.requested_fullscreen = None;
+            }
+        }
+        if self.requested_fullscreen == Some(self.fullscreen) {
+            self.requested_fullscreen = None;
+        }
+    }
+
+    unsafe fn release_fullscreen_sync(&mut self) {
+        if !self.fullscreen_sync.is_null() {
+            // wl_callback has no destroy request; release the local proxy.
+            wayland::wl_proxy_destroy(self.fullscreen_sync);
+            self.fullscreen_sync = ptr::null_mut();
+        }
+        self.fullscreen_request_in_flight = None;
     }
 
     unsafe fn start_interactive_resize(&mut self, serial: u32, edge: u32) {
@@ -1921,9 +1981,11 @@ impl ClientState {
             self.windowed_height = self.height;
         }
         self.fullscreen = self.pending_fullscreen;
-        // An older configure can arrive after a newer fullscreen request.
-        // Keep the latest intent until the compositor reports that state.
-        if self.requested_fullscreen == Some(self.fullscreen) {
+        // Activation and resize configures can precede the fullscreen reply.
+        // Preserve both in-flight and queued intent until the sync barrier.
+        if self.fullscreen_request_in_flight.is_none()
+            && self.requested_fullscreen == Some(self.fullscreen)
+        {
             self.requested_fullscreen = None;
         }
         if self.pending_width == 0 || self.pending_height == 0 {
@@ -1950,6 +2012,29 @@ impl ClientState {
             }
         }
     }
+}
+
+#[repr(C)]
+struct FullscreenSyncListener {
+    done: unsafe extern "C" fn(*mut c_void, *mut wayland::WlProxy, u32),
+}
+
+static FULLSCREEN_SYNC_LISTENER: FullscreenSyncListener = FullscreenSyncListener {
+    done: fullscreen_sync_done,
+};
+
+unsafe extern "C" fn fullscreen_sync_done(
+    data: *mut c_void,
+    callback: *mut wayland::WlProxy,
+    _callback_data: u32,
+) {
+    let state = &mut *data.cast::<ClientState>();
+    if state.fullscreen_sync != callback {
+        return;
+    }
+    state.fullscreen_sync = ptr::null_mut();
+    wayland::wl_proxy_destroy(callback);
+    state.complete_fullscreen_request();
 }
 
 struct WaylandWindow {
@@ -2233,7 +2318,14 @@ impl WaylandWindow {
             while wayland::wl_display_dispatch_pending(self.state.display) > 0 {}
             self.apply_state(matrix);
 
-            self.state.running && wayland::wl_display_get_error(self.state.display) == 0
+            let running =
+                self.state.running && wayland::wl_display_get_error(self.state.display) == 0;
+            if running {
+                // Coalesce key presses and process queued configures before
+                // sending at most one request for the latest desired state.
+                self.state.send_pending_fullscreen();
+            }
+            running && self.state.running
         }
     }
 
@@ -2262,6 +2354,7 @@ impl Drop for WaylandWindow {
     fn drop(&mut self) {
         unsafe {
             // Cursor buffers and their surface must be released before disconnecting.
+            self.state.release_fullscreen_sync();
             self.state.cursor.take();
             // HDR GL objects need the current context; protocol objects need the display.
             self.hdr.take();
@@ -3564,6 +3657,7 @@ mod wayland {
     pub const WL_SEAT_GET_KEYBOARD: u32 = 1;
 
     unsafe extern "C" {
+        pub static wl_callback_interface: WlInterface;
         pub static wl_registry_interface: WlInterface;
         pub static wl_compositor_interface: WlInterface;
         pub static wl_shm_interface: WlInterface;

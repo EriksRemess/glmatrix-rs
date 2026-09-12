@@ -146,8 +146,15 @@ Run all tests, including pixel-readback rendering tests, with Mesa's surfaceless
 EGL platform (no desktop window is opened):
 
 ```sh
-LIBGL_ALWAYS_SOFTWARE=true cargo test -- --include-ignored --test-threads=1
+__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json \
+  LIBGL_ALWAYS_SOFTWARE=true cargo test -- --include-ignored --test-threads=1
 ```
+
+Install Mesa's EGL driver first and adjust the vendor JSON path if your distribution
+places it elsewhere. Explicit vendor selection matters on systems with proprietary
+NVIDIA drivers: `LIBGL_ALWAYS_SOFTWARE` alone does not select Mesa, and the HDR
+pixel tests require fixed 10-bit EGL pbuffers that the NVIDIA driver may not offer.
+The application separately supports FP16 HDR window configurations.
 
 The rendering tests cover titlebar fading over HDR rain, opaque black borders,
 PQ highlight and reference-white levels, transparent overlay compositing,

@@ -228,9 +228,10 @@ fn kana_atlas_contains_every_glyph_and_mirrors_exactly() {
     }
 }
 
-// These tests render to EGL pbuffers without opening a desktop window. Run with
-// LIBGL_ALWAYS_SOFTWARE=true cargo test -- --include-ignored --test-threads=1
-// on machines providing Mesa's surfaceless EGL platform.
+// These tests render to EGL pbuffers without opening a desktop window. Use the
+// README's Testing command to explicitly select Mesa's surfaceless EGL platform
+// and software renderer. LIBGL_ALWAYS_SOFTWARE alone does not select Mesa on
+// multi-vendor systems; the HDR fixtures require fixed 10-bit pbuffers.
 unsafe fn headless_window(width: i32, height: i32) -> WaylandWindow {
     headless_window_with_bits(width, height, 8)
 }
@@ -503,6 +504,84 @@ struct InputFixture {
 }
 
 impl InputFixture {
+    fn finish_fullscreen_request(&mut self) {
+        use std::io::Write;
+        let callback = self.state.fullscreen_sync;
+        assert!(
+            !callback.is_null(),
+            "fullscreen request must have a sync callback"
+        );
+        let id = unsafe { wl_proxy_get_id(callback) };
+        // wl_callback.done followed by wl_display.delete_id. Dispatch through
+        // libwayland so the listener ABI and proxy lifecycle are exercised too.
+        let mut wire = Vec::new();
+        for word in [id, 12_u32 << 16, 0, 1, (12_u32 << 16) | 1, id] {
+            wire.extend_from_slice(&word.to_ne_bytes());
+        }
+        self._peer.write_all(&wire).unwrap();
+        unsafe {
+            assert!(wayland::wl_display_dispatch(self.state.display) >= 0);
+        }
+        assert!(self.state.fullscreen_sync.is_null());
+    }
+
+    fn with_toplevel() -> Self {
+        let mut fixture = Self::new();
+        unsafe {
+            let state = &mut fixture.state;
+            state.compositor =
+                registry_bind(state.registry, 100, &wayland::wl_compositor_interface, 4).cast();
+            state.wm_base = registry_bind(state.registry, 101, state.xdg.wm_base, 1);
+            state.surface = compositor_create_surface(state.compositor);
+            state.xdg_surface =
+                xdg_wm_base_get_xdg_surface(state.wm_base, state.xdg.surface, state.surface);
+            state.xdg_toplevel = xdg_surface_get_toplevel(state.xdg_surface, state.xdg.toplevel);
+            assert!(!state.xdg_toplevel.is_null());
+        }
+        fixture.fullscreen_requests();
+        fixture
+    }
+
+    fn fullscreen_requests(&mut self) -> Vec<u16> {
+        use std::io::{ErrorKind, Read};
+        let object = unsafe {
+            assert!(wayland::wl_display_flush(self.state.display) >= 0);
+            wl_proxy_get_id(self.state.xdg_toplevel)
+        };
+        self._peer.set_nonblocking(true).unwrap();
+        let mut wire = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            match self._peer.read(&mut buffer) {
+                Ok(0) => panic!("Wayland test socket closed"),
+                Ok(length) => wire.extend_from_slice(&buffer[..length]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => panic!("reading Wayland requests: {error}"),
+            }
+        }
+        let mut requests = Vec::new();
+        let mut offset = 0;
+        while offset < wire.len() {
+            assert!(wire.len() - offset >= 8);
+            let id = u32::from_ne_bytes(wire[offset..offset + 4].try_into().unwrap());
+            let header = u32::from_ne_bytes(wire[offset + 4..offset + 8].try_into().unwrap());
+            let size = (header >> 16) as usize;
+            let opcode = header as u16;
+            assert!(size >= 8 && offset + size <= wire.len());
+            if id == object
+                && [
+                    XDG_TOPLEVEL_SET_FULLSCREEN as u16,
+                    XDG_TOPLEVEL_UNSET_FULLSCREEN as u16,
+                ]
+                .contains(&opcode)
+            {
+                requests.push(opcode);
+            }
+            offset += size;
+        }
+        requests
+    }
+
     fn new() -> Self {
         use std::os::fd::IntoRawFd;
         let (client, peer) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -540,6 +619,7 @@ impl InputFixture {
 impl Drop for InputFixture {
     fn drop(&mut self) {
         unsafe {
+            self.state.release_fullscreen_sync();
             self.state.release_pointer();
             self.state.release_keyboard();
             release_input_proxy(self.state.seat.cast(), 3, 5);
@@ -581,6 +661,195 @@ fn input_capabilities_can_be_removed_and_readded() {
 }
 
 #[test]
+fn rapid_fullscreen_toggles_coalesce_while_a_request_is_in_flight() {
+    let mut fixture = InputFixture::with_toplevel();
+    unsafe {
+        fixture.state.toggle_fullscreen();
+        fixture.state.send_pending_fullscreen();
+    }
+    assert_eq!(
+        fixture.fullscreen_requests(),
+        [XDG_TOPLEVEL_SET_FULLSCREEN as u16]
+    );
+    unsafe {
+        fixture.state.toggle_fullscreen(); // off
+        fixture.state.toggle_fullscreen(); // on again
+        fixture.state.send_pending_fullscreen();
+    }
+    assert!(fixture.fullscreen_requests().is_empty());
+    configure(
+        &mut fixture.state,
+        1920,
+        1080,
+        &mut [XDG_TOPLEVEL_STATE_FULLSCREEN],
+    );
+    assert_eq!(fixture.state.fullscreen_request_in_flight, Some(true));
+    fixture.finish_fullscreen_request();
+    unsafe {
+        fixture.state.send_pending_fullscreen();
+    }
+    assert!(fixture.fullscreen_requests().is_empty());
+    assert!(fixture.state.fullscreen);
+    assert_eq!(fixture.state.fullscreen_request_in_flight, None);
+    assert_eq!(fixture.state.requested_fullscreen, None);
+    unsafe {
+        fixture.state.toggle_fullscreen();
+        fixture.state.send_pending_fullscreen();
+    }
+    assert_eq!(
+        fixture.fullscreen_requests(),
+        [XDG_TOPLEVEL_UNSET_FULLSCREEN as u16]
+    );
+}
+
+#[test]
+fn queued_fullscreen_exit_waits_for_the_entry_reply() {
+    let mut fixture = InputFixture::with_toplevel();
+    unsafe {
+        fixture.state.toggle_fullscreen();
+        fixture.state.send_pending_fullscreen();
+        fixture.state.toggle_fullscreen();
+        fixture.state.send_pending_fullscreen();
+    }
+    assert_eq!(
+        fixture.fullscreen_requests(),
+        [XDG_TOPLEVEL_SET_FULLSCREEN as u16]
+    );
+    configure(
+        &mut fixture.state,
+        1920,
+        1080,
+        &mut [XDG_TOPLEVEL_STATE_FULLSCREEN],
+    );
+    assert_eq!(fixture.state.requested_fullscreen, Some(false));
+    assert!(
+        fixture.fullscreen_requests().is_empty(),
+        "do not send inside the configure callback"
+    );
+    fixture.finish_fullscreen_request();
+    unsafe {
+        fixture.state.send_pending_fullscreen();
+    }
+    assert_eq!(
+        fixture.fullscreen_requests(),
+        [XDG_TOPLEVEL_UNSET_FULLSCREEN as u16]
+    );
+    configure(&mut fixture.state, 0, 0, &mut []);
+    fixture.finish_fullscreen_request();
+    assert!(!fixture.state.fullscreen);
+    assert_eq!(fixture.state.requested_fullscreen, None);
+    assert_eq!(fixture.state.fullscreen_request_in_flight, None);
+    assert_eq!((fixture.state.width, fixture.state.height), (1280, 720));
+}
+
+#[test]
+fn rejected_fullscreen_request_does_not_block_retry() {
+    let mut fixture = InputFixture::with_toplevel();
+    unsafe {
+        fixture.state.toggle_fullscreen();
+        fixture.state.send_pending_fullscreen();
+    }
+    assert_eq!(
+        fixture.fullscreen_requests(),
+        [XDG_TOPLEVEL_SET_FULLSCREEN as u16]
+    );
+    configure(&mut fixture.state, 1280, 720, &mut []);
+    fixture.finish_fullscreen_request();
+    assert_eq!(fixture.state.requested_fullscreen, None);
+    assert_eq!(fixture.state.fullscreen_request_in_flight, None);
+    unsafe {
+        fixture.state.toggle_fullscreen();
+        fixture.state.send_pending_fullscreen();
+    }
+    assert_eq!(
+        fixture.fullscreen_requests(),
+        [XDG_TOPLEVEL_SET_FULLSCREEN as u16]
+    );
+}
+
+#[test]
+fn unrelated_configures_do_not_complete_fullscreen_requests() {
+    for initial in [false, true] {
+        let mut fixture = InputFixture::with_toplevel();
+        fixture.state.fullscreen = initial;
+        fixture.state.pending_fullscreen = initial;
+        unsafe {
+            fixture.state.toggle_fullscreen();
+            fixture.state.send_pending_fullscreen();
+            fixture.state.toggle_fullscreen(); // return to the initial state
+        }
+        let first = if initial {
+            XDG_TOPLEVEL_UNSET_FULLSCREEN
+        } else {
+            XDG_TOPLEVEL_SET_FULLSCREEN
+        };
+        let second = if initial {
+            XDG_TOPLEVEL_SET_FULLSCREEN
+        } else {
+            XDG_TOPLEVEL_UNSET_FULLSCREEN
+        };
+        assert_eq!(fixture.fullscreen_requests(), [first as u16]);
+
+        // An unrelated activation/resize configure retains the old state.
+        let mut states = if initial {
+            vec![XDG_TOPLEVEL_STATE_FULLSCREEN]
+        } else {
+            vec![]
+        };
+        configure(&mut fixture.state, 1200, 700, &mut states);
+        assert_eq!(fixture.state.fullscreen_request_in_flight, Some(!initial));
+        assert_eq!(fixture.state.requested_fullscreen, Some(initial));
+        unsafe {
+            fixture.state.send_pending_fullscreen();
+        }
+        assert!(fixture.fullscreen_requests().is_empty());
+
+        // The real response still must not release the queue before sync.done.
+        let mut states = if initial {
+            vec![]
+        } else {
+            vec![XDG_TOPLEVEL_STATE_FULLSCREEN]
+        };
+        configure(&mut fixture.state, 1920, 1080, &mut states);
+        assert_eq!(fixture.state.fullscreen_request_in_flight, Some(!initial));
+        assert_eq!(fixture.state.requested_fullscreen, Some(initial));
+        unsafe {
+            fixture.state.send_pending_fullscreen();
+        }
+        assert!(fixture.fullscreen_requests().is_empty());
+
+        fixture.finish_fullscreen_request();
+        unsafe {
+            fixture.state.send_pending_fullscreen();
+        }
+        assert_eq!(fixture.fullscreen_requests(), [second as u16]);
+        let mut states = if initial {
+            vec![XDG_TOPLEVEL_STATE_FULLSCREEN]
+        } else {
+            vec![]
+        };
+        configure(&mut fixture.state, 1200, 700, &mut states);
+        fixture.finish_fullscreen_request();
+        assert_eq!(fixture.state.fullscreen, initial);
+        assert_eq!(fixture.state.requested_fullscreen, None);
+        assert_eq!(fixture.state.fullscreen_request_in_flight, None);
+    }
+}
+
+#[test]
+fn fullscreen_toggles_in_one_dispatch_batch_cancel_without_requests() {
+    let mut fixture = InputFixture::with_toplevel();
+    unsafe {
+        fixture.state.toggle_fullscreen();
+        fixture.state.toggle_fullscreen();
+        fixture.state.send_pending_fullscreen();
+    }
+    assert!(fixture.fullscreen_requests().is_empty());
+    assert_eq!(fixture.state.requested_fullscreen, None);
+    assert_eq!(fixture.state.fullscreen_request_in_flight, None);
+}
+
+#[test]
 fn removing_active_seat_selects_an_available_replacement() {
     let mut fixture = InputFixture::new();
     fixture.announce(1, 5);
@@ -619,7 +888,9 @@ fn hdr_modes_accept_only_documented_values() {
 
 fn config_attribute(attributes: &[i32], name: i32) -> Option<i32> {
     attributes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .find_map(|pair| (pair[0] == name).then_some(pair[1]))
 }
 
@@ -810,6 +1081,7 @@ fn hdr_resize_reallocates_both_layers_and_preserves_viewport() {
 }
 
 unsafe extern "C" {
+    fn wl_proxy_get_id(proxy: *mut wayland::WlProxy) -> u32;
     fn wl_display_connect_to_fd(fd: c_int) -> *mut wayland::WlDisplay;
     fn eglGetPlatformDisplay(
         platform: u32,
