@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::env;
 use std::ffi::{CStr, CString};
 use std::mem;
@@ -5,7 +6,7 @@ use std::os::raw::{c_char, c_int, c_long, c_short, c_uint, c_void};
 use std::process;
 use std::ptr;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CHAR_COLS: usize = 16;
 const CHAR_ROWS: usize = 13;
@@ -682,7 +683,7 @@ impl Matrix {
             gl::glPopMatrix();
         }
         if window.uses_client_decoration() {
-            self.draw_client_border(window.size());
+            self.draw_client_border(window.size(), window.state.titlebar_alpha());
         }
 
         unsafe {
@@ -691,7 +692,7 @@ impl Matrix {
         window.swap_buffers();
     }
 
-    fn draw_client_border(&self, (width, height): (u32, u32)) {
+    fn draw_client_border(&self, (width, height): (u32, u32), alpha: f32) {
         let w = width.max(1) as f32;
         let h = height.max(1) as f32;
         let border = CLIENT_DECORATION_BORDER as f32;
@@ -711,11 +712,12 @@ impl Matrix {
             gl::glPushMatrix();
             gl::glLoadIdentity();
 
-            gl::glColor4f(0.0, 0.08, 0.025, 0.86);
+            gl::glColor4f(0.0, 0.08, 0.025, 0.86 * alpha);
             draw_screen_rect(0.0, 0.0, w, title);
+            gl::glColor4f(0.0, 0.0, 0.0, 1.0);
             draw_screen_rect(0.0, title, border, h - title);
             draw_screen_rect(w - border, title, border, h - title);
-            draw_screen_rect(0.0, h - border, w, border);
+            draw_screen_rect(border, h - border, w - border * 2.0, border);
 
             gl::glColor4f(0.10, 1.0, 0.30, 0.90);
             draw_screen_rect(0.0, 0.0, w, 1.0);
@@ -723,16 +725,23 @@ impl Matrix {
             draw_screen_rect(w - 1.0, 0.0, 1.0, h);
             draw_screen_rect(0.0, h - 1.0, w, 1.0);
 
-            gl::glColor4f(0.25, 1.0, 0.45, 0.42);
-            draw_screen_rect(border, title - 1.0, w - border * 2.0, 1.0);
+            gl::glColor4f(0.25, 1.0, 0.45, 0.42 * alpha);
+            draw_screen_rect(0.0, title - 1.0, w, 1.0);
 
             let title_scale = 1.0;
-            let title_width = measure_client_title_width(WINDOW_TITLE_TEXT, title_scale);
+            let mut title_text = WINDOW_TITLE_TEXT.to_string();
+            while measure_client_title_width(&title_text, title_scale) > (w - title * 2.0).max(0.0) {
+                if title_text.pop().is_none() {
+                    break;
+                }
+            }
+            let title_width = measure_client_title_width(&title_text, title_scale);
             let title_x = ((w - title_width) * 0.5).max(border + 6.0);
-            let title_y = ((title - 7.0 * title_scale) * 0.5).clamp(2.0, title - 8.0);
+            let title_y = (title - 7.0 * title_scale) * 0.5;
 
-            gl::glColor4f(0.42, 1.0, 0.55, 0.95);
-            draw_client_title_text(WINDOW_TITLE_TEXT, title_x, title_y, title_scale);
+            gl::glColor4f(0.42, 1.0, 0.55, 0.95 * alpha);
+            draw_client_title_text(&title_text, title_x, title_y, title_scale);
+            draw_client_title_text("X", w - title * 0.5 - 2.5, title_y, title_scale);
 
             gl::glPopMatrix();
             gl::glMatrixMode(gl::GL_PROJECTION);
@@ -1518,6 +1527,10 @@ struct ClientState {
     running: bool,
     pointer_down: bool,
     fullscreen: bool,
+    focused: bool,
+    last_mouse_activity: Instant,
+    titlebar_last_update: Cell<Instant>,
+    titlebar_opacity: Cell<f32>,
     decoration_mode: u32,
     pointer_x: f64,
     pointer_y: f64,
@@ -1556,6 +1569,10 @@ impl ClientState {
             running: true,
             pointer_down: false,
             fullscreen: false,
+            focused: true,
+            last_mouse_activity: Instant::now(),
+            titlebar_last_update: Cell::new(Instant::now()),
+            titlebar_opacity: Cell::new(1.0),
             decoration_mode: ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE,
             pointer_x: 0.0,
             pointer_y: 0.0,
@@ -1579,8 +1596,40 @@ impl ClientState {
     }
 
     fn update_pointer(&mut self, x: wayland::WlFixed, y: wayland::WlFixed) {
+        self.last_mouse_activity = Instant::now();
         self.pointer_x = fixed_to_f64(x);
         self.pointer_y = fixed_to_f64(y);
+    }
+
+    fn titlebar_alpha(&self) -> f32 {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.titlebar_last_update.replace(now));
+        let target = if self.focused
+            && now.duration_since(self.last_mouse_activity) < Duration::from_millis(1500)
+        {
+            1.0
+        } else {
+            0.0
+        };
+        let previous = self.titlebar_opacity.get();
+        let step = elapsed.as_secs_f32() / 0.25;
+        let alpha = if previous < target {
+            (previous + step).min(target)
+        } else {
+            (previous - step).max(target)
+        };
+        self.titlebar_opacity.set(alpha);
+        alpha
+    }
+
+    fn pointer_on_close_button(&self) -> bool {
+        let title = CLIENT_DECORATION_TITLE as f64;
+        self.uses_client_decoration()
+            && self.titlebar_opacity.get() > 0.001
+            && self.pointer_x >= (self.width as f64 - title).max(0.0)
+            && self.pointer_x < self.width as f64
+            && self.pointer_y >= 0.0
+            && self.pointer_y < title.min(self.height as f64)
     }
 
     fn resize_edge_at_pointer(&self) -> u32 {
@@ -2528,20 +2577,24 @@ unsafe extern "C" fn keyboard_keymap(
 }
 
 unsafe extern "C" fn keyboard_enter(
-    _data: *mut c_void,
+    data: *mut c_void,
     _keyboard: *mut wayland::WlKeyboard,
     _serial: u32,
     _surface: *mut wayland::WlSurface,
     _keys: *mut wayland::WlArray,
 ) {
+    let state = &mut *(data.cast::<ClientState>());
+    state.focused = true;
+    state.last_mouse_activity = Instant::now();
 }
 
 unsafe extern "C" fn keyboard_leave(
-    _data: *mut c_void,
+    data: *mut c_void,
     _keyboard: *mut wayland::WlKeyboard,
     _serial: u32,
     _surface: *mut wayland::WlSurface,
 ) {
+    (*(data.cast::<ClientState>())).focused = false;
 }
 
 unsafe extern "C" fn keyboard_key(
@@ -2630,6 +2683,13 @@ unsafe extern "C" fn pointer_button(
     if button == BTN_LEFT {
         let state = &mut *(data.cast::<ClientState>());
         if state_value == WL_POINTER_BUTTON_STATE_PRESSED {
+            if state.pointer_on_close_button() {
+                state.pointer_down = false;
+                state.press_active = false;
+                state.running = false;
+                return;
+            }
+            state.last_mouse_activity = Instant::now();
             if state.is_double_click(time) {
                 state.pointer_down = false;
                 state.press_active = false;
