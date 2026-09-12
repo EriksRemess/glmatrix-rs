@@ -232,6 +232,10 @@ fn kana_atlas_contains_every_glyph_and_mirrors_exactly() {
 // LIBGL_ALWAYS_SOFTWARE=true cargo test -- --include-ignored --test-threads=1
 // on machines providing Mesa's surfaceless EGL platform.
 unsafe fn headless_window(width: i32, height: i32) -> WaylandWindow {
+    headless_window_with_bits(width, height, 8)
+}
+
+unsafe fn headless_window_with_bits(width: i32, height: i32, bits: i32) -> WaylandWindow {
     let display = eglGetPlatformDisplay(0x31DD, ptr::null_mut(), ptr::null());
     assert!(!display.is_null(), "surfaceless EGL display unavailable");
     assert_ne!(
@@ -245,13 +249,13 @@ unsafe fn headless_window(width: i32, height: i32) -> WaylandWindow {
         egl::EGL_RENDERABLE_TYPE,
         egl::EGL_OPENGL_BIT,
         egl::EGL_RED_SIZE,
-        8,
+        bits,
         egl::EGL_GREEN_SIZE,
-        8,
+        bits,
         egl::EGL_BLUE_SIZE,
-        8,
+        bits,
         egl::EGL_ALPHA_SIZE,
-        8,
+        if bits >= 10 { 2 } else { 8 },
         egl::EGL_NONE,
     ];
     let mut config = ptr::null_mut();
@@ -275,6 +279,8 @@ unsafe fn headless_window(width: i32, height: i32) -> WaylandWindow {
         egl_display: display,
         egl_surface: surface,
         egl_context: context,
+        hdr: None,
+        hdr_colors: None,
     }
 }
 
@@ -599,6 +605,208 @@ fn removing_active_seat_selects_an_available_replacement() {
     assert_eq!(fixture.state.seat_global_name, Some(3));
     fixture.capabilities(WL_SEAT_CAPABILITY_POINTER);
     assert!(!fixture.state.pointer.is_null());
+}
+
+#[test]
+fn hdr_modes_accept_only_documented_values() {
+    assert!(matches!(hdr::Mode::parse("auto"), Ok(hdr::Mode::Auto)));
+    assert!(matches!(hdr::Mode::parse("on"), Ok(hdr::Mode::On)));
+    assert!(matches!(hdr::Mode::parse("off"), Ok(hdr::Mode::Off)));
+    for value in ["", "true", "false", "AUTO", "1", "pq"] {
+        assert!(hdr::Mode::parse(value).is_err(), "accepted {value:?}");
+    }
+}
+
+fn config_attribute(attributes: &[i32], name: i32) -> Option<i32> {
+    attributes
+        .chunks_exact(2)
+        .find_map(|pair| (pair[0] == name).then_some(pair[1]))
+}
+
+#[test]
+fn hdr_config_prefers_fixed_point_without_requiring_alpha() {
+    let mut calls = 0;
+    let config = ptr::dangling_mut::<c_void>();
+    let selected = hdr::select_config(true, |attributes| {
+        calls += 1;
+        assert_eq!(config_attribute(attributes, egl::EGL_RED_SIZE), Some(10));
+        assert_eq!(config_attribute(attributes, egl::EGL_GREEN_SIZE), Some(10));
+        assert_eq!(config_attribute(attributes, egl::EGL_BLUE_SIZE), Some(10));
+        assert_eq!(config_attribute(attributes, egl::EGL_ALPHA_SIZE), Some(0));
+        assert_eq!(config_attribute(attributes, 0x3339), None);
+        Some(config)
+    })
+    .unwrap();
+    assert_eq!(selected, (config, "10-bit"));
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn hdr_config_explicitly_requests_fp16_after_fixed_point_fails() {
+    let mut calls = 0;
+    let config = ptr::dangling_mut::<c_void>();
+    let selected = hdr::select_config(true, |attributes| {
+        calls += 1;
+        if calls == 1 {
+            return None;
+        }
+        assert_eq!(config_attribute(attributes, 0x3339), Some(0x333B));
+        for channel in [egl::EGL_RED_SIZE, egl::EGL_GREEN_SIZE, egl::EGL_BLUE_SIZE] {
+            assert_eq!(config_attribute(attributes, channel), Some(16));
+        }
+        assert_eq!(config_attribute(attributes, egl::EGL_ALPHA_SIZE), Some(0));
+        Some(config)
+    })
+    .unwrap();
+    assert_eq!(selected, (config, "FP16"));
+    assert_eq!(calls, 2);
+}
+
+#[test]
+fn hdr_config_failure_respects_float_extension_availability() {
+    for supports_float in [false, true] {
+        let mut calls = 0;
+        let result = hdr::select_config(supports_float, |attributes| {
+            calls += 1;
+            if !supports_float {
+                assert_eq!(config_attribute(attributes, 0x3339), None);
+            }
+            None
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, if supports_float { 2 } else { 1 });
+    }
+}
+
+fn pixel_from_top(bytes: &[u8], size: (u32, u32), x: u32, y: u32) -> [u8; 4] {
+    let offset = ((size.1 - 1 - y) * size.0 + x) as usize * 4;
+    bytes[offset..offset + 4].try_into().unwrap()
+}
+
+unsafe fn clear_rgba(r: f32, g: f32, b: f32, a: f32) {
+    gl::glClearColor(r, g, b, a);
+    gl::glClear(gl::GL_COLOR_BUFFER_BIT);
+    gl::glClearColor(0.0, 0.0, 0.0, 1.0);
+}
+
+#[test]
+#[ignore = "requires surfaceless EGL"]
+fn hdr_faded_titlebar_does_not_dim_underlying_rain() {
+    let size = (128, 80);
+    let _window = unsafe { headless_window_with_bits(128, 80, 10) };
+    let mut matrix = Matrix::new(options());
+    matrix.init_gl();
+    let mut renderer = unsafe { hdr::Renderer::new(600.0, size).unwrap() };
+    let mut previous = 0;
+    for alpha in [1.0, 0.5, 0.0] {
+        unsafe {
+            renderer.begin(size).unwrap();
+            clear_rgba(1.0, 1.0, 1.0, 1.0);
+            renderer.begin_decorations();
+        }
+        matrix.draw_client_border_layer(size, alpha, true);
+        unsafe {
+            renderer.present();
+        }
+        let rendered = pixels(128, 80);
+        let title = pixel_from_top(&rendered, size, 20, 15);
+        let rain = pixel_from_top(&rendered, size, 20, 40);
+        assert!(
+            title[1] > previous,
+            "rain did not brighten as the overlay faded"
+        );
+        previous = title[1];
+        if alpha == 0.0 {
+            for channel in 0..3 {
+                assert!(
+                    title[channel].abs_diff(rain[channel]) <= 1,
+                    "faded titlebar left a dim band: {title:?} vs {rain:?}"
+                );
+            }
+        }
+        assert_eq!(pixel_from_top(&rendered, size, 4, 40), [0, 0, 0, 255]);
+        assert!(rendered
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[3] == 255));
+    }
+}
+
+#[test]
+#[ignore = "requires surfaceless EGL"]
+fn hdr_pq_pixels_preserve_black_highlights_and_overlay_reference_white() {
+    let size = (64, 64);
+    let _window = unsafe { headless_window_with_bits(64, 64, 10) };
+    let mut matrix = Matrix::new(options());
+    matrix.init_gl();
+    let mut renderer = unsafe { hdr::Renderer::new(600.0, size).unwrap() };
+    let mut values = Vec::new();
+    // Reference PQ code values rounded to 8-bit readback: black=0,
+    // 600 cd/m2=178, and 203 cd/m2 reference white=148.
+    for (scene, overlay_alpha, expected) in [
+        (0.0, 0.0, 0_u8),
+        (1.0, 0.0, 178),
+        (1.0, 1.0, 148),
+        (1.0, 0.5, 166),
+    ] {
+        unsafe {
+            renderer.begin(size).unwrap();
+            clear_rgba(scene, scene, scene, 1.0);
+            renderer.begin_decorations();
+            clear_rgba(overlay_alpha, overlay_alpha, overlay_alpha, overlay_alpha);
+            renderer.present();
+        }
+        let pixel = pixel_from_top(&pixels(64, 64), size, 32, 32);
+        for channel in &pixel[..3] {
+            assert!(
+                channel.abs_diff(expected) <= 2,
+                "unexpected PQ output: {pixel:?}, expected {expected}"
+            );
+        }
+        assert_eq!(pixel[3], 255);
+        values.push(pixel[1]);
+    }
+    assert!(values[1] > values[3] && values[3] > values[2]);
+}
+
+#[test]
+#[ignore = "requires surfaceless EGL"]
+fn hdr_resize_reallocates_both_layers_and_preserves_viewport() {
+    let _window = unsafe { headless_window_with_bits(128, 96, 10) };
+    let mut matrix = Matrix::new(options());
+    matrix.init_gl();
+    let mut renderer = unsafe { hdr::Renderer::new(600.0, (64, 64)).unwrap() };
+    for size in [(128, 96), (32, 32), (96, 64)] {
+        unsafe {
+            gl::glViewport(3, 5, 60, 50);
+            renderer.begin(size).unwrap();
+            clear_rgba(1.0, 1.0, 1.0, 1.0);
+            renderer.begin_decorations();
+        }
+        matrix.draw_client_border_layer(size, 0.0, true);
+        unsafe {
+            renderer.present();
+        }
+        let mut viewport = [0; 4];
+        unsafe {
+            gl::glGetIntegerv(gl::GL_VIEWPORT, viewport.as_mut_ptr());
+        }
+        assert_eq!(viewport, [3, 5, 60, 50]);
+        let rendered = pixels(size.0 as i32, size.1 as i32);
+        assert!(pixel_from_top(&rendered, size, size.0 / 2, size.1 / 2)[1].abs_diff(178) <= 2);
+        assert_eq!(
+            pixel_from_top(&rendered, size, size.0 / 2, size.1 - 4),
+            [0, 0, 0, 255]
+        );
+    }
+    unsafe {
+        assert!(renderer.begin((u32::MAX, 64)).is_err());
+        renderer.begin((64, 64)).unwrap();
+        renderer.begin_decorations();
+        renderer.present();
+        assert_eq!(glGetError(), 0);
+    }
 }
 
 unsafe extern "C" {

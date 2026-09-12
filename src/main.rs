@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod cursor;
+mod hdr;
 mod kana;
 mod keyboard;
 #[cfg(test)]
@@ -162,7 +163,8 @@ struct Options {
 }
 
 impl Options {
-    fn parse() -> Result<Option<Self>, String> {
+    fn parse() -> Result<Option<(Self, hdr::Mode)>, String> {
+        let mut hdr_mode = hdr::Mode::Auto;
         let mut options = Self {
             speed: 1.0,
             density: 20.0,
@@ -183,6 +185,13 @@ impl Options {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-h" | "--help" => return Ok(None),
+                "--hdr" => {
+                    let value = args.next().ok_or("--hdr requires auto, on, or off")?;
+                    hdr_mode = hdr::Mode::parse(&value)?;
+                }
+                value if value.starts_with("--hdr=") => {
+                    hdr_mode = hdr::Mode::parse(&value[6..])?;
+                }
                 "-speed" | "--speed" => {
                     options.speed = parse_f32_arg(&arg, args.next())?;
                 }
@@ -238,7 +247,7 @@ impl Options {
             options.do_texture = false;
         }
 
-        Ok(Some(options))
+        Ok(Some((options, hdr_mode)))
     }
 }
 
@@ -285,6 +294,7 @@ Options:
   -texture / +texture  enable/disable textured glyphs
   -flip / +flip        enable/disable glyph mirroring (default: disabled)
   -wireframe           draw glyph outlines
+  --hdr=auto|on|off    HDR output, default auto (SDR fallback)
   -width N             initial window width, default 1280, maximum 16384
   -height N            initial window height, default 720, maximum 16384
 
@@ -690,7 +700,8 @@ impl Matrix {
         }
     }
 
-    fn draw_frame(&mut self, window: &WaylandWindow) {
+    fn draw_frame(&mut self, window: &mut WaylandWindow) -> Result<(), String> {
+        window.begin_frame()?;
         if window.state.erase_requested.replace(false) {
             for strip in &mut self.strips {
                 strip.dy = -(0.6 + self.rng.frand(0.6)) * self.options.speed;
@@ -741,7 +752,14 @@ impl Matrix {
         unsafe {
             gl::glPopMatrix();
         }
-        if window.uses_client_decoration() {
+        if let Some(renderer) = window.hdr.as_ref() {
+            unsafe {
+                renderer.begin_decorations();
+            }
+            if window.uses_client_decoration() {
+                self.draw_client_border_layer(window.size(), window.state.titlebar_alpha(), true);
+            }
+        } else if window.uses_client_decoration() {
             self.draw_client_border(window.size(), window.state.titlebar_alpha());
         }
         window.state.update_cursor();
@@ -749,10 +767,15 @@ impl Matrix {
         unsafe {
             gl::glFinish();
         }
-        window.swap_buffers();
+        window.swap_buffers()?;
+        Ok(())
     }
 
     fn draw_client_border(&self, (width, height): (u32, u32), alpha: f32) {
+        self.draw_client_border_layer((width, height), alpha, false);
+    }
+
+    fn draw_client_border_layer(&self, (width, height): (u32, u32), alpha: f32, transparent: bool) {
         let w = width.max(1) as f32;
         let h = height.max(1) as f32;
         let border = CLIENT_DECORATION_BORDER as f32;
@@ -762,11 +785,20 @@ impl Matrix {
             let mut viewport = [0; 4];
             gl::glGetIntegerv(gl::GL_VIEWPORT, viewport.as_mut_ptr());
             gl::glViewport(0, 0, width as c_int, height as c_int);
-            // Decorations blend over the rain without making the surface transparent.
-            gl::glColorMask(1, 1, 1, 0);
+            // HDR keeps a premultiplied overlay; SDR preserves the window alpha.
+            gl::glColorMask(1, 1, 1, u8::from(transparent));
             gl::glDisable(gl::GL_TEXTURE_2D);
             gl::glEnable(gl::GL_BLEND);
-            gl::glBlendFunc(gl::GL_SRC_ALPHA, gl::GL_ONE_MINUS_SRC_ALPHA);
+            if transparent {
+                gl::glBlendFuncSeparate(
+                    gl::GL_SRC_ALPHA,
+                    gl::GL_ONE_MINUS_SRC_ALPHA,
+                    gl::GL_ONE,
+                    gl::GL_ONE_MINUS_SRC_ALPHA,
+                );
+            } else {
+                gl::glBlendFunc(gl::GL_SRC_ALPHA, gl::GL_ONE_MINUS_SRC_ALPHA);
+            }
 
             gl::glMatrixMode(gl::GL_PROJECTION);
             gl::glPushMatrix();
@@ -1925,10 +1957,12 @@ struct WaylandWindow {
     egl_display: egl::EGLDisplay,
     egl_surface: egl::EGLSurface,
     egl_context: egl::EGLContext,
+    hdr: Option<hdr::Renderer>,
+    hdr_colors: Option<hdr::ColorManagement>,
 }
 
 impl WaylandWindow {
-    fn new(width: u32, height: u32, title: &str) -> Result<Self, String> {
+    fn new(width: u32, height: u32, title: &str, hdr_mode: hdr::Mode) -> Result<Self, String> {
         unsafe {
             let display = wayland::wl_display_connect(ptr::null());
             if display.is_null() {
@@ -2053,57 +2087,116 @@ impl WaylandWindow {
                 ));
             }
 
-            let config = choose_egl_config(egl_display)?;
-            let context = create_egl_context(egl_display, config)?;
-
-            state.egl_window = wayland_egl::wl_egl_window_create(
-                state.surface,
-                state.width as c_int,
-                state.height as c_int,
-            );
-            if state.egl_window.is_null() {
-                egl::eglDestroyContext(egl_display, context);
-                egl::eglTerminate(egl_display);
-                wayland::wl_display_disconnect(display);
-                return Err("wl_egl_window_create failed".to_string());
-            }
-
-            let egl_surface = egl::eglCreateWindowSurface(
-                egl_display,
-                config,
-                state.egl_window.cast(),
-                ptr::null(),
-            );
-            if egl_surface.is_null() {
-                wayland_egl::wl_egl_window_destroy(state.egl_window);
-                egl::eglDestroyContext(egl_display, context);
-                egl::eglTerminate(egl_display);
-                wayland::wl_display_disconnect(display);
-                return Err(format!(
-                    "eglCreateWindowSurface failed: 0x{:x}",
-                    egl::eglGetError()
-                ));
-            }
-
-            if egl::eglMakeCurrent(egl_display, egl_surface, egl_surface, context) == egl::EGL_FALSE
-            {
-                egl::eglDestroySurface(egl_display, egl_surface);
-                wayland_egl::wl_egl_window_destroy(state.egl_window);
-                egl::eglDestroyContext(egl_display, context);
-                egl::eglTerminate(egl_display);
-                wayland::wl_display_disconnect(display);
-                return Err(format!("eglMakeCurrent failed: 0x{:x}", egl::eglGetError()));
-            }
-
-            egl::eglSwapInterval(egl_display, 1);
-
-            Ok(Self {
+            let mut window = Self {
                 state,
                 egl_display,
-                egl_surface,
-                egl_context: context,
-            })
+                egl_surface: ptr::null_mut(),
+                egl_context: ptr::null_mut(),
+                hdr: None,
+                hdr_colors: None,
+            };
+            window.init_rendering(hdr_mode)?;
+            Ok(window)
         }
+    }
+
+    unsafe fn init_rendering(&mut self, mode: hdr::Mode) -> Result<(), String> {
+        self.state.egl_window = wayland_egl::wl_egl_window_create(
+            self.state.surface,
+            self.state.width as c_int,
+            self.state.height as c_int,
+        );
+        if self.state.egl_window.is_null() {
+            return Err("wl_egl_window_create failed".into());
+        }
+
+        if mode != hdr::Mode::Off {
+            let attempt = (|| {
+                let colors =
+                    hdr::ColorManagement::new(self.state.display, self.state.surface, mode)?;
+                let (config, format) = hdr::choose_config(self.egl_display)?;
+                self.create_rendering_context(config)?;
+                let renderer = hdr::Renderer::new(colors.peak(), self.size())?;
+                colors.activate();
+                self.hdr = Some(renderer);
+                self.hdr_colors = Some(colors);
+                Ok::<&str, String>(format)
+            })();
+            match attempt {
+                Ok(format) => {
+                    eprintln!("glmatrix-rs: HDR enabled ({format} BT.2020/PQ)");
+                    return Ok(());
+                }
+                Err(error) if mode == hdr::Mode::On => {
+                    return Err(format!("HDR requested but unavailable: {error}"));
+                }
+                Err(error) => {
+                    self.clear_rendering_context();
+                    if wayland::wl_display_get_error(self.state.display) != 0 {
+                        return Err(format!("Wayland color management failed: {error}"));
+                    }
+                    eprintln!("glmatrix-rs: HDR unavailable ({error}); using SDR");
+                }
+            }
+        }
+        let config = choose_egl_config(self.egl_display)?;
+        self.create_rendering_context(config)
+    }
+
+    unsafe fn create_rendering_context(&mut self, config: egl::EGLConfig) -> Result<(), String> {
+        self.egl_context = create_egl_context(self.egl_display, config)?;
+        self.egl_surface = egl::eglCreateWindowSurface(
+            self.egl_display,
+            config,
+            self.state.egl_window.cast(),
+            ptr::null(),
+        );
+        if self.egl_surface.is_null() {
+            return Err(format!(
+                "eglCreateWindowSurface failed: 0x{:x}",
+                egl::eglGetError()
+            ));
+        }
+        if egl::eglMakeCurrent(
+            self.egl_display,
+            self.egl_surface,
+            self.egl_surface,
+            self.egl_context,
+        ) == egl::EGL_FALSE
+        {
+            return Err(format!("eglMakeCurrent failed: 0x{:x}", egl::eglGetError()));
+        }
+        egl::eglSwapInterval(self.egl_display, 1);
+        Ok(())
+    }
+
+    unsafe fn clear_rendering_context(&mut self) {
+        self.hdr.take();
+        self.hdr_colors.take();
+        egl::eglMakeCurrent(
+            self.egl_display,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        if !self.egl_surface.is_null() {
+            egl::eglDestroySurface(self.egl_display, self.egl_surface);
+            self.egl_surface = ptr::null_mut();
+        }
+        if !self.egl_context.is_null() {
+            egl::eglDestroyContext(self.egl_display, self.egl_context);
+            self.egl_context = ptr::null_mut();
+        }
+    }
+
+    fn begin_frame(&mut self) -> Result<(), String> {
+        let size = self.size();
+        if let Some(renderer) = self.hdr.as_mut() {
+            unsafe {
+                renderer.begin(size)?;
+            }
+        }
+        Ok(())
     }
 
     fn size(&self) -> (u32, u32) {
@@ -2152,10 +2245,16 @@ impl WaylandWindow {
         }
     }
 
-    fn swap_buffers(&self) {
+    fn swap_buffers(&self) -> Result<(), String> {
         unsafe {
-            egl::eglSwapBuffers(self.egl_display, self.egl_surface);
+            if let Some(renderer) = self.hdr.as_ref() {
+                renderer.present();
+            }
+            if egl::eglSwapBuffers(self.egl_display, self.egl_surface) == egl::EGL_FALSE {
+                return Err(format!("eglSwapBuffers failed: 0x{:x}", egl::eglGetError()));
+            }
         }
+        Ok(())
     }
 }
 
@@ -2164,6 +2263,9 @@ impl Drop for WaylandWindow {
         unsafe {
             // Cursor buffers and their surface must be released before disconnecting.
             self.state.cursor.take();
+            // HDR GL objects need the current context; protocol objects need the display.
+            self.hdr.take();
+            self.hdr_colors.take();
             if !self.egl_display.is_null() {
                 egl::eglMakeCurrent(
                     self.egl_display,
@@ -3079,19 +3181,20 @@ unsafe extern "C" {
 }
 
 fn run() -> Result<(), String> {
-    let Some(options) = Options::parse()? else {
+    let Some((options, hdr_mode)) = Options::parse()? else {
         print_help();
         return Ok(());
     };
 
-    let mut window = WaylandWindow::new(options.width, options.height, WINDOW_TITLE_TEXT)?;
+    let mut window =
+        WaylandWindow::new(options.width, options.height, WINDOW_TITLE_TEXT, hdr_mode)?;
     let mut matrix = Matrix::new(options);
     matrix.init_gl();
     let (width, height) = window.size();
     matrix.reshape(width, height);
 
     while window.poll_events(&mut matrix) {
-        matrix.draw_frame(&window);
+        matrix.draw_frame(&mut window)?;
         thread::sleep(DEFAULT_DELAY);
     }
 
@@ -3179,6 +3282,12 @@ mod gl {
         pub fn glBegin(mode: GLenum);
         pub fn glBindTexture(target: GLenum, texture: GLuint);
         pub fn glBlendFunc(sfactor: GLenum, dfactor: GLenum);
+        pub fn glBlendFuncSeparate(
+            src_rgb: GLenum,
+            dst_rgb: GLenum,
+            src_alpha: GLenum,
+            dst_alpha: GLenum,
+        );
         pub fn glClear(mask: GLbitfield);
         pub fn glClearColor(red: GLfloat, green: GLfloat, blue: GLfloat, alpha: GLfloat);
         pub fn glColor4f(red: GLfloat, green: GLfloat, blue: GLfloat, alpha: GLfloat);
