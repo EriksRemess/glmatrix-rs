@@ -40,8 +40,8 @@ button, through `libwayland-cursor`,
 respecting `XCURSOR_THEME` and `XCURSOR_SIZE` when set.
 In fullscreen, the cursor hides after 1.5 seconds of mouse inactivity and
 reappears on movement, a click, or scrolling.
-Building requires Rust and the development libraries for Wayland, EGL, OpenGL,
-and xkbcommon. On Debian/Ubuntu, install `libwayland-dev libegl-dev libgl-dev
+Building requires Rust 1.100 or newer and the development libraries for Wayland,
+EGL, OpenGL, and xkbcommon. On Debian/Ubuntu, install `libwayland-dev libegl-dev libgl-dev
 libxkbcommon-dev`. Runtime installations need the corresponding shared libraries.
 
 ## Install

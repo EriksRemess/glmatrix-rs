@@ -2,9 +2,13 @@
 name = "glmatrix-rs"
 version = "0.1.4"
 description = "A Wayland-native, dependency-free Rust port of xscreensaver's GLMatrix hack."
-edition = "2021"
+edition = "2024"
+rust-version = "1.100"
 build = "build.rs"
 license = "MIT"
 repository = "https://github.com/EriksRemess/glmatrix-rs"
 
 [dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

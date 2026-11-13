@@ -45,10 +45,12 @@ fn message(
 }
 
 unsafe fn define(interface: *mut WlInterface, methods: Vec<WlMessage>, events: Vec<WlMessage>) {
-    (*interface).method_count = methods.len() as i32;
-    (*interface).methods = Box::leak(methods.into_boxed_slice()).as_ptr();
-    (*interface).event_count = events.len() as i32;
-    (*interface).events = Box::leak(events.into_boxed_slice()).as_ptr();
+    unsafe {
+        (*interface).method_count = methods.len() as i32;
+        (*interface).methods = Box::leak(methods.into_boxed_slice()).as_ptr();
+        (*interface).event_count = events.len() as i32;
+        (*interface).events = Box::leak(events.into_boxed_slice()).as_ptr();
+    }
 }
 
 pub fn interfaces() -> &'static Interfaces {
@@ -56,7 +58,7 @@ pub fn interfaces() -> &'static Interfaces {
     // process lifetime, as required by libwayland. Store the published address
     // rather than making the general-purpose raw FFI types Sync.
     static ADDRESS: OnceLock<usize> = OnceLock::new();
-    let address = *ADDRESS.get_or_init(|| unsafe {
+    let address = *ADDRESS.get_or_init(|| {
         let p = Interfaces {
             manager: allocate(c"wp_color_manager_v1"),
             surface: allocate(c"wp_color_management_surface_v1"),
@@ -65,20 +67,19 @@ pub fn interfaces() -> &'static Interfaces {
             description: allocate(c"wp_image_description_v1"),
             info: allocate(c"wp_image_description_info_v1"),
         };
-        define(
-            p.manager,
+        let (methods, events) = (
             vec![
                 message(c"destroy", c"", &[]),
                 message(c"get_output", c"no", &[ptr::null(), ptr::null()]),
                 message(
                     c"get_surface",
                     c"no",
-                    &[p.surface, &wayland::wl_surface_interface],
+                    &[p.surface, &raw const wayland::wl_surface_interface],
                 ),
                 message(
                     c"get_surface_feedback",
                     c"no",
-                    &[p.feedback, &wayland::wl_surface_interface],
+                    &[p.feedback, &raw const wayland::wl_surface_interface],
                 ),
                 message(c"create_icc_creator", c"n", &[]),
                 message(c"create_parametric_creator", c"n", &[p.params]),
@@ -92,8 +93,8 @@ pub fn interfaces() -> &'static Interfaces {
                 message(c"done", c"", &[]),
             ],
         );
-        define(
-            p.surface,
+        unsafe { define(p.manager, methods, events) };
+        let (methods, events) = (
             vec![
                 message(c"destroy", c"", &[]),
                 message(
@@ -105,8 +106,8 @@ pub fn interfaces() -> &'static Interfaces {
             ],
             vec![],
         );
-        define(
-            p.feedback,
+        unsafe { define(p.surface, methods, events) };
+        let (methods, events) = (
             vec![
                 message(c"destroy", c"", &[]),
                 message(c"get_preferred", c"n", &[p.description]),
@@ -114,8 +115,8 @@ pub fn interfaces() -> &'static Interfaces {
             ],
             vec![message(c"preferred_changed", c"u", &[])],
         );
-        define(
-            p.params,
+        unsafe { define(p.feedback, methods, events) };
+        let (methods, events) = (
             vec![
                 message(c"create", c"n", &[p.description]),
                 message(c"set_tf_named", c"u", &[]),
@@ -130,16 +131,16 @@ pub fn interfaces() -> &'static Interfaces {
             ],
             vec![],
         );
-        define(
-            p.description,
+        unsafe { define(p.params, methods, events) };
+        let (methods, events) = (
             vec![
                 message(c"destroy", c"", &[]),
                 message(c"get_information", c"n", &[p.info]),
             ],
             vec![message(c"failed", c"us", &[]), message(c"ready", c"u", &[])],
         );
-        define(
-            p.info,
+        unsafe { define(p.description, methods, events) };
+        let (methods, events) = (
             vec![],
             vec![
                 message(c"done", c"", &[]),
@@ -155,6 +156,7 @@ pub fn interfaces() -> &'static Interfaces {
                 message(c"target_max_fall", c"u", &[]),
             ],
         );
+        unsafe { define(p.info, methods, events) };
         Box::into_raw(Box::new(p)) as usize
     });
     unsafe { &*(address as *const Interfaces) }

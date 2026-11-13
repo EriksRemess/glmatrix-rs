@@ -1,4 +1,5 @@
 use std::ffi::{c_char, c_void};
+use std::ptr::NonNull;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -8,42 +9,26 @@ pub enum Action {
 }
 
 pub struct KeyboardState {
-    state: *mut c_void,
+    state: NonNull<c_void>,
 }
 
 impl KeyboardState {
     pub fn new(keymap: &[u8]) -> Result<Self, &'static str> {
-        let keymap = keymap.strip_suffix(&[0]).unwrap_or(keymap);
-        unsafe {
-            let context = xkb_context_new(0);
-            if context.is_null() {
-                return Err("could not create XKB context");
-            }
-            let map =
-                xkb_keymap_new_from_buffer(context, keymap.as_ptr().cast(), keymap.len(), 1, 0);
-            xkb_context_unref(context);
-            if map.is_null() {
-                return Err("could not compile keyboard keymap");
-            }
-            let state = xkb_state_new(map);
-            xkb_keymap_unref(map);
-            if state.is_null() {
-                return Err("could not create keyboard state");
-            }
-            Ok(Self { state })
-        }
+        let context = Context::new()?;
+        let map = context.compile(keymap.trim_suffix(&[0]))?;
+        map.state()
     }
 
     pub fn update_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
         unsafe {
-            xkb_state_update_mask(self.state, depressed, latched, locked, 0, 0, group);
+            xkb_state_update_mask(self.state.as_ptr(), depressed, latched, locked, 0, 0, group);
         }
     }
 
     pub fn action(&self, wayland_key: u32) -> Option<Action> {
         // Wayland sends evdev codes; XKB keycodes have an offset of eight.
         let keycode = wayland_key.checked_add(8)?;
-        let keysym = unsafe { xkb_state_key_get_one_sym(self.state, keycode) };
+        let keysym = unsafe { xkb_state_key_get_one_sym(self.state.as_ptr(), keycode) };
         match keysym {
             0xff1b | 0x71 | 0x51 => Some(Action::Quit),
             0x66 | 0x46 => Some(Action::Fullscreen),
@@ -55,7 +40,50 @@ impl KeyboardState {
 
 impl Drop for KeyboardState {
     fn drop(&mut self) {
-        unsafe { xkb_state_unref(self.state) };
+        unsafe { xkb_state_unref(self.state.as_ptr()) };
+    }
+}
+
+struct Context(NonNull<c_void>);
+
+impl Context {
+    fn new() -> Result<Self, &'static str> {
+        NonNull::new(unsafe { xkb_context_new(0) })
+            .map(Self)
+            .ok_or("could not create XKB context")
+    }
+
+    fn compile(&self, keymap: &[u8]) -> Result<Keymap, &'static str> {
+        let map = unsafe {
+            xkb_keymap_new_from_buffer(self.0.as_ptr(), keymap.as_ptr().cast(), keymap.len(), 1, 0)
+        };
+        NonNull::new(map)
+            .map(Keymap)
+            .ok_or("could not compile keyboard keymap")
+    }
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        unsafe { xkb_context_unref(self.0.as_ptr()) };
+    }
+}
+
+struct Keymap(NonNull<c_void>);
+
+impl Keymap {
+    fn state(&self) -> Result<KeyboardState, &'static str> {
+        // libxkbcommon retains the keymap for the new state's lifetime.
+        let state = unsafe { xkb_state_new(self.0.as_ptr()) };
+        NonNull::new(state)
+            .map(|state| KeyboardState { state })
+            .ok_or("could not create keyboard state")
+    }
+}
+
+impl Drop for Keymap {
+    fn drop(&mut self) {
+        unsafe { xkb_keymap_unref(self.0.as_ptr()) };
     }
 }
 

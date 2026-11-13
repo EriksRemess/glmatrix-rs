@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::env;
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::mem;
+use std::mem::{self, DropGuard};
 use std::os::fd::FromRawFd;
 use std::os::raw::{c_char, c_int, c_long, c_short, c_uint, c_void};
 use std::os::unix::fs::FileExt;
@@ -432,12 +432,17 @@ impl Matrix {
             rng: Rng::new(),
             texture: 0,
             nstrips,
-            strips: Vec::with_capacity(nstrips),
+            strips: Vec::new(),
             glyph_map,
             tex_char_width: 0.0,
             tex_char_height: 0.0,
             real_char_rows: REAL_CHAR_ROWS as i32,
-            brightness_ramp: [0.0; WAVE_SIZE],
+            brightness_ramp: std::array::from_fn(|i| {
+                let mut j = (WAVE_SIZE - i) as f32 / (WAVE_SIZE - 1) as f32;
+                j *= std::f32::consts::FRAC_PI_2;
+                j = j.sin();
+                0.2 + j * 0.8
+            }),
             last_view: 0,
             target_view: 0,
             view_x: NICE_VIEWS[0].x,
@@ -449,17 +454,7 @@ impl Matrix {
             button_down: false,
         };
 
-        for i in 0..WAVE_SIZE {
-            let mut j = (WAVE_SIZE - i) as f32 / (WAVE_SIZE - 1) as f32;
-            j *= std::f32::consts::FRAC_PI_2;
-            j = j.sin();
-            matrix.brightness_ramp[i] = 0.2 + j * 0.8;
-        }
-
-        for _ in 0..nstrips {
-            let strip = matrix.random_strip(true);
-            matrix.strips.push(strip);
-        }
+        matrix.strips = Vec::from_fn(nstrips, |_| matrix.random_strip(true));
 
         matrix
     }
@@ -781,6 +776,17 @@ impl Matrix {
         let border = CLIENT_DECORATION_BORDER as f32;
         let title = CLIENT_DECORATION_TITLE as f32;
 
+        let title_scale = 1.0;
+        let mut title_text = WINDOW_TITLE_TEXT.to_string();
+        while measure_client_title_width(&title_text, title_scale) > (w - title * 2.0).max(0.0) {
+            if title_text.pop().is_none() {
+                break;
+            }
+        }
+        let title_width = measure_client_title_width(&title_text, title_scale);
+        let title_x = ((w - title_width) * 0.5).max(border + 6.0);
+        let title_y = (title - 7.0 * title_scale) * 0.5;
+
         unsafe {
             let mut viewport = [0; 4];
             gl::glGetIntegerv(gl::GL_VIEWPORT, viewport.as_mut_ptr());
@@ -825,18 +831,6 @@ impl Matrix {
             gl::glColor4f(0.25, 1.0, 0.45, 0.42 * alpha);
             draw_screen_rect(0.0, title - 1.0, w, 1.0);
 
-            let title_scale = 1.0;
-            let mut title_text = WINDOW_TITLE_TEXT.to_string();
-            while measure_client_title_width(&title_text, title_scale) > (w - title * 2.0).max(0.0)
-            {
-                if title_text.pop().is_none() {
-                    break;
-                }
-            }
-            let title_width = measure_client_title_width(&title_text, title_scale);
-            let title_x = ((w - title_width) * 0.5).max(border + 6.0);
-            let title_y = (title - 7.0 * title_scale) * 0.5;
-
             gl::glColor4f(0.42, 1.0, 0.55, 0.95 * alpha);
             draw_client_title_text(&title_text, title_x, title_y, title_scale);
             draw_client_title_text("X", w - title * 0.5 - 2.5, title_y, title_scale);
@@ -855,7 +849,7 @@ impl Matrix {
             let glyph = strip.glyphs[i];
             let mut below = strip.spinner_y >= i as f32;
             if strip.erasing {
-                below = !below;
+                below.toggle();
             }
 
             if glyph != 0 && below {
@@ -1443,25 +1437,18 @@ fn current_time_text(format: &str) -> String {
         return String::new();
     };
 
-    unsafe {
-        let mut now: ctime::TimeT = 0;
-        ctime::time(&mut now);
+    let mut now: ctime::TimeT = 0;
+    unsafe { ctime::time(&mut now) };
 
-        let mut tm = mem::MaybeUninit::<ctime::Tm>::zeroed();
-        if ctime::localtime_r(&now, tm.as_mut_ptr()).is_null() {
-            return String::new();
-        }
-        let tm = tm.assume_init();
-
-        let mut buf = [0 as c_char; 128];
-        let len = ctime::strftime(buf.as_mut_ptr(), buf.len(), format.as_ptr(), &tm);
-        if len == 0 {
-            return String::new();
-        }
-
-        let bytes = std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), len);
-        String::from_utf8_lossy(bytes).into_owned()
+    let mut tm = mem::MaybeUninit::<ctime::Tm>::zeroed();
+    if unsafe { ctime::localtime_r(&now, tm.as_mut_ptr()) }.is_null() {
+        return String::new();
     }
+    let tm = unsafe { tm.assume_init() };
+
+    let mut buf = [0_u8; 128];
+    let len = unsafe { ctime::strftime(buf.as_mut_ptr().cast(), buf.len(), format.as_ptr(), &tm) };
+    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 struct XdgInterfaces {
@@ -1519,120 +1506,117 @@ impl XdgInterfaces {
             }))
         }
 
-        unsafe {
-            let wm_base = interface("xdg_wm_base", 6);
-            let surface = interface("xdg_surface", 6);
-            let toplevel = interface("xdg_toplevel", 6);
-            let positioner = interface("xdg_positioner", 6);
-            let popup = interface("xdg_popup", 6);
-            let decoration_manager = interface("zxdg_decoration_manager_v1", 1);
-            let toplevel_decoration = interface("zxdg_toplevel_decoration_v1", 1);
+        let wm_base = interface("xdg_wm_base", 6);
+        let surface = interface("xdg_surface", 6);
+        let toplevel = interface("xdg_toplevel", 6);
+        let positioner = interface("xdg_positioner", 6);
+        let popup = interface("xdg_popup", 6);
+        let decoration_manager = interface("zxdg_decoration_manager_v1", 1);
+        let toplevel_decoration = interface("zxdg_toplevel_decoration_v1", 1);
 
-            positioner.method_count = 10;
-            positioner.methods = messages(vec![
-                message("destroy", "", vec![]),
-                message("set_size", "ii", vec![ptr::null(), ptr::null()]),
-                message("set_anchor_rect", "iiii", vec![ptr::null(); 4]),
-                message("set_anchor", "u", vec![ptr::null()]),
-                message("set_gravity", "u", vec![ptr::null()]),
-                message("set_constraint_adjustment", "u", vec![ptr::null()]),
-                message("set_offset", "ii", vec![ptr::null(), ptr::null()]),
-                message("set_reactive", "3", vec![]),
-                message("set_parent_size", "3ii", vec![ptr::null(), ptr::null()]),
-                message("set_parent_configure", "3u", vec![ptr::null()]),
-            ]);
+        positioner.method_count = 10;
+        positioner.methods = messages(vec![
+            message("destroy", "", vec![]),
+            message("set_size", "ii", vec![ptr::null(), ptr::null()]),
+            message("set_anchor_rect", "iiii", vec![ptr::null(); 4]),
+            message("set_anchor", "u", vec![ptr::null()]),
+            message("set_gravity", "u", vec![ptr::null()]),
+            message("set_constraint_adjustment", "u", vec![ptr::null()]),
+            message("set_offset", "ii", vec![ptr::null(), ptr::null()]),
+            message("set_reactive", "3", vec![]),
+            message("set_parent_size", "3ii", vec![ptr::null(), ptr::null()]),
+            message("set_parent_configure", "3u", vec![ptr::null()]),
+        ]);
 
-            popup.method_count = 3;
-            popup.methods = messages(vec![
-                message("destroy", "", vec![]),
-                message("grab", "ou", vec![ptr::null(), ptr::null()]),
-                message("reposition", "3ou", vec![positioner, ptr::null()]),
-            ]);
-            popup.event_count = 3;
-            popup.events = messages(vec![
-                message("configure", "iiii", vec![ptr::null(); 4]),
-                message("popup_done", "", vec![]),
-                message("repositioned", "3u", vec![ptr::null()]),
-            ]);
+        popup.method_count = 3;
+        popup.methods = messages(vec![
+            message("destroy", "", vec![]),
+            message("grab", "ou", vec![ptr::null(), ptr::null()]),
+            message("reposition", "3ou", vec![positioner, ptr::null()]),
+        ]);
+        popup.event_count = 3;
+        popup.events = messages(vec![
+            message("configure", "iiii", vec![ptr::null(); 4]),
+            message("popup_done", "", vec![]),
+            message("repositioned", "3u", vec![ptr::null()]),
+        ]);
 
-            wm_base.method_count = 4;
-            wm_base.methods = messages(vec![
-                message("destroy", "", vec![]),
-                message("create_positioner", "n", vec![positioner]),
-                message(
-                    "get_xdg_surface",
-                    "no",
-                    vec![surface, &wayland::wl_surface_interface],
-                ),
-                message("pong", "u", vec![ptr::null()]),
-            ]);
-            wm_base.event_count = 1;
-            wm_base.events = messages(vec![message("ping", "u", vec![ptr::null()])]);
+        wm_base.method_count = 4;
+        wm_base.methods = messages(vec![
+            message("destroy", "", vec![]),
+            message("create_positioner", "n", vec![positioner]),
+            message(
+                "get_xdg_surface",
+                "no",
+                vec![surface, &raw const wayland::wl_surface_interface],
+            ),
+            message("pong", "u", vec![ptr::null()]),
+        ]);
+        wm_base.event_count = 1;
+        wm_base.events = messages(vec![message("ping", "u", vec![ptr::null()])]);
 
-            surface.method_count = 5;
-            surface.methods = messages(vec![
-                message("destroy", "", vec![]),
-                message("get_toplevel", "n", vec![toplevel]),
-                message("get_popup", "n?oo", vec![popup, surface, positioner]),
-                message("set_window_geometry", "iiii", vec![ptr::null(); 4]),
-                message("ack_configure", "u", vec![ptr::null()]),
-            ]);
-            surface.event_count = 1;
-            surface.events = messages(vec![message("configure", "u", vec![ptr::null()])]);
+        surface.method_count = 5;
+        surface.methods = messages(vec![
+            message("destroy", "", vec![]),
+            message("get_toplevel", "n", vec![toplevel]),
+            message("get_popup", "n?oo", vec![popup, surface, positioner]),
+            message("set_window_geometry", "iiii", vec![ptr::null(); 4]),
+            message("ack_configure", "u", vec![ptr::null()]),
+        ]);
+        surface.event_count = 1;
+        surface.events = messages(vec![message("configure", "u", vec![ptr::null()])]);
 
-            toplevel.method_count = 14;
-            toplevel.methods = messages(vec![
-                message("destroy", "", vec![]),
-                message("set_parent", "?o", vec![toplevel]),
-                message("set_title", "s", vec![ptr::null()]),
-                message("set_app_id", "s", vec![ptr::null()]),
-                message("show_window_menu", "ouii", vec![ptr::null(); 4]),
-                message("move", "ou", vec![ptr::null(), ptr::null()]),
-                message("resize", "ouu", vec![ptr::null(); 3]),
-                message("set_max_size", "ii", vec![ptr::null(), ptr::null()]),
-                message("set_min_size", "ii", vec![ptr::null(), ptr::null()]),
-                message("set_maximized", "", vec![]),
-                message("unset_maximized", "", vec![]),
-                message("set_fullscreen", "?o", vec![ptr::null()]),
-                message("unset_fullscreen", "", vec![]),
-                message("set_minimized", "", vec![]),
-            ]);
-            toplevel.event_count = 4;
-            toplevel.events = messages(vec![
-                message("configure", "iia", vec![ptr::null(); 3]),
-                message("close", "", vec![]),
-                message("configure_bounds", "4ii", vec![ptr::null(), ptr::null()]),
-                message("wm_capabilities", "5a", vec![ptr::null()]),
-            ]);
+        toplevel.method_count = 14;
+        toplevel.methods = messages(vec![
+            message("destroy", "", vec![]),
+            message("set_parent", "?o", vec![toplevel]),
+            message("set_title", "s", vec![ptr::null()]),
+            message("set_app_id", "s", vec![ptr::null()]),
+            message("show_window_menu", "ouii", vec![ptr::null(); 4]),
+            message("move", "ou", vec![ptr::null(), ptr::null()]),
+            message("resize", "ouu", vec![ptr::null(); 3]),
+            message("set_max_size", "ii", vec![ptr::null(), ptr::null()]),
+            message("set_min_size", "ii", vec![ptr::null(), ptr::null()]),
+            message("set_maximized", "", vec![]),
+            message("unset_maximized", "", vec![]),
+            message("set_fullscreen", "?o", vec![ptr::null()]),
+            message("unset_fullscreen", "", vec![]),
+            message("set_minimized", "", vec![]),
+        ]);
+        toplevel.event_count = 4;
+        toplevel.events = messages(vec![
+            message("configure", "iia", vec![ptr::null(); 3]),
+            message("close", "", vec![]),
+            message("configure_bounds", "4ii", vec![ptr::null(), ptr::null()]),
+            message("wm_capabilities", "5a", vec![ptr::null()]),
+        ]);
 
-            decoration_manager.method_count = 2;
-            decoration_manager.methods = messages(vec![
-                message("destroy", "", vec![]),
-                message(
-                    "get_toplevel_decoration",
-                    "no",
-                    vec![toplevel_decoration, toplevel],
-                ),
-            ]);
+        decoration_manager.method_count = 2;
+        decoration_manager.methods = messages(vec![
+            message("destroy", "", vec![]),
+            message(
+                "get_toplevel_decoration",
+                "no",
+                vec![toplevel_decoration, toplevel],
+            ),
+        ]);
 
-            toplevel_decoration.method_count = 3;
-            toplevel_decoration.methods = messages(vec![
-                message("destroy", "", vec![]),
-                message("set_mode", "u", vec![ptr::null()]),
-                message("unset_mode", "", vec![]),
-            ]);
-            toplevel_decoration.event_count = 1;
-            toplevel_decoration.events =
-                messages(vec![message("configure", "u", vec![ptr::null()])]);
+        toplevel_decoration.method_count = 3;
+        toplevel_decoration.methods = messages(vec![
+            message("destroy", "", vec![]),
+            message("set_mode", "u", vec![ptr::null()]),
+            message("unset_mode", "", vec![]),
+        ]);
+        toplevel_decoration.event_count = 1;
+        toplevel_decoration.events = messages(vec![message("configure", "u", vec![ptr::null()])]);
 
-            Box::leak(Box::new(Self {
-                wm_base,
-                surface,
-                toplevel,
-                decoration_manager,
-                toplevel_decoration,
-            }))
-        }
+        Box::leak(Box::new(Self {
+            wm_base,
+            surface,
+            toplevel,
+            decoration_manager,
+            toplevel_decoration,
+        }))
     }
 }
 
@@ -1788,12 +1772,10 @@ impl ClientState {
 
     fn update_cursor(&self) {
         if let (Some(cursor), Some(serial)) = (&self.cursor, self.pointer_enter_serial) {
-            unsafe {
-                if self.cursor_should_hide() {
-                    cursor.hide(self.pointer, serial);
-                } else {
-                    cursor.update(self.pointer, serial, self.pointer_on_close_button());
-                }
+            if self.cursor_should_hide() {
+                unsafe { cursor.hide(self.pointer, serial) };
+            } else {
+                unsafe { cursor.update(self.pointer, serial, self.pointer_on_close_button()) };
             }
         }
     }
@@ -1803,7 +1785,7 @@ impl ClientState {
     }
 
     unsafe fn release_pointer(&mut self) {
-        release_input_proxy(self.pointer.cast(), 1, 3);
+        unsafe { release_input_proxy(self.pointer.cast(), 1, 3) };
         self.pointer = ptr::null_mut();
         self.pointer_enter_serial = None;
         self.pointer_down = false;
@@ -1813,22 +1795,31 @@ impl ClientState {
     }
 
     unsafe fn release_keyboard(&mut self) {
-        release_input_proxy(self.keyboard.cast(), 0, 3);
+        unsafe { release_input_proxy(self.keyboard.cast(), 0, 3) };
         self.keyboard = ptr::null_mut();
         self.keyboard_state = None;
         self.focused = false;
     }
 
     unsafe fn bind_seat(&mut self, registry: *mut wayland::WlRegistry, name: u32, version: u32) {
-        self.seat =
-            registry_bind(registry, name, &wayland::wl_seat_interface, version.min(5)).cast();
+        self.seat = unsafe {
+            registry_bind(
+                registry,
+                name,
+                &raw const wayland::wl_seat_interface,
+                version.min(5),
+            )
+        }
+        .cast();
         if !self.seat.is_null() {
             self.seat_global_name = Some(name);
-            wayland::wl_proxy_add_listener(
-                self.seat.cast(),
-                (&SEAT_LISTENER as *const wayland::WlSeatListener).cast(),
-                (self as *mut ClientState).cast(),
-            );
+            unsafe {
+                wayland::wl_proxy_add_listener(
+                    self.seat.cast(),
+                    (&SEAT_LISTENER as *const wayland::WlSeatListener).cast(),
+                    (self as *mut ClientState).cast(),
+                )
+            };
         }
     }
 
@@ -1878,7 +1869,7 @@ impl ClientState {
         elapsed <= DOUBLE_CLICK_MS && (dx * dx + dy * dy).sqrt() <= DOUBLE_CLICK_DISTANCE
     }
 
-    unsafe fn toggle_fullscreen(&mut self) {
+    fn toggle_fullscreen(&mut self) {
         if self.xdg_toplevel.is_null() {
             return;
         }
@@ -1898,41 +1889,45 @@ impl ClientState {
             return;
         }
         if fullscreen {
-            xdg_toplevel_set_fullscreen(self.xdg_toplevel);
+            unsafe { xdg_toplevel_set_fullscreen(self.xdg_toplevel) };
         } else {
-            xdg_toplevel_unset_fullscreen(self.xdg_toplevel);
+            unsafe { xdg_toplevel_unset_fullscreen(self.xdg_toplevel) };
         }
         self.fullscreen_request_in_flight = Some(fullscreen);
         // Configure events are not request acknowledgements. The sync callback
         // marks completion of the preceding request and its resulting events.
-        self.fullscreen_sync = wayland::wl_proxy_marshal_flags(
-            self.display.cast(),
-            0, // wl_display.sync
-            &wayland::wl_callback_interface,
-            1,
-            0,
-            ptr::null_mut::<c_void>(),
-        );
+        self.fullscreen_sync = unsafe {
+            wayland::wl_proxy_marshal_flags(
+                self.display.cast(),
+                0, // wl_display.sync
+                &raw const wayland::wl_callback_interface,
+                1,
+                0,
+                ptr::null_mut::<c_void>(),
+            )
+        };
         if self.fullscreen_sync.is_null()
-            || wayland::wl_proxy_add_listener(
-                self.fullscreen_sync,
-                (&FULLSCREEN_SYNC_LISTENER as *const FullscreenSyncListener).cast(),
-                (self as *mut ClientState).cast(),
-            ) != 0
+            || unsafe {
+                wayland::wl_proxy_add_listener(
+                    self.fullscreen_sync,
+                    (&FULLSCREEN_SYNC_LISTENER as *const FullscreenSyncListener).cast(),
+                    (self as *mut ClientState).cast(),
+                )
+            } != 0
         {
             eprintln!("could not synchronize fullscreen request");
-            self.release_fullscreen_sync();
+            unsafe { self.release_fullscreen_sync() };
             self.running = false;
         }
     }
 
     fn complete_fullscreen_request(&mut self) {
-        if let Some(sent) = self.fullscreen_request_in_flight.take() {
-            if self.requested_fullscreen == Some(sent) {
-                // No different target was queued. Accept the compositor's
-                // final state, including a rejected request.
-                self.requested_fullscreen = None;
-            }
+        if let Some(sent) = self.fullscreen_request_in_flight.take()
+            && self.requested_fullscreen == Some(sent)
+        {
+            // No different target was queued. Accept the compositor's
+            // final state, including a rejected request.
+            self.requested_fullscreen = None;
         }
         if self.requested_fullscreen == Some(self.fullscreen) {
             self.requested_fullscreen = None;
@@ -1942,7 +1937,7 @@ impl ClientState {
     unsafe fn release_fullscreen_sync(&mut self) {
         if !self.fullscreen_sync.is_null() {
             // wl_callback has no destroy request; release the local proxy.
-            wayland::wl_proxy_destroy(self.fullscreen_sync);
+            unsafe { wayland::wl_proxy_destroy(self.fullscreen_sync) };
             self.fullscreen_sync = ptr::null_mut();
         }
         self.fullscreen_request_in_flight = None;
@@ -1956,7 +1951,7 @@ impl ClientState {
             return;
         }
 
-        xdg_toplevel_resize(self.xdg_toplevel, self.seat, serial, edge);
+        unsafe { xdg_toplevel_resize(self.xdg_toplevel, self.seat, serial, edge) };
     }
 
     unsafe fn maybe_start_interactive_move(&mut self) {
@@ -1970,7 +1965,7 @@ impl ClientState {
             return;
         }
 
-        xdg_toplevel_move(self.xdg_toplevel, self.seat, self.press_serial);
+        unsafe { xdg_toplevel_move(self.xdg_toplevel, self.seat, self.press_serial) };
         self.pointer_down = false;
         self.press_active = false;
     }
@@ -2028,12 +2023,12 @@ unsafe extern "C" fn fullscreen_sync_done(
     callback: *mut wayland::WlProxy,
     _callback_data: u32,
 ) {
-    let state = &mut *data.cast::<ClientState>();
+    let state = unsafe { &mut *data.cast::<ClientState>() };
     if state.fullscreen_sync != callback {
         return;
     }
     state.fullscreen_sync = ptr::null_mut();
-    wayland::wl_proxy_destroy(callback);
+    unsafe { wayland::wl_proxy_destroy(callback) };
     state.complete_fullscreen_request();
 }
 
@@ -2048,161 +2043,170 @@ struct WaylandWindow {
 
 impl WaylandWindow {
     fn new(width: u32, height: u32, title: &str, hdr_mode: hdr::Mode) -> Result<Self, String> {
+        let display = unsafe { wayland::wl_display_connect(ptr::null()) };
+        if display.is_null() {
+            return Err("could not connect to a Wayland compositor".to_string());
+        }
+
+        let display = DropGuard::new(display, |display| unsafe {
+            wayland::wl_display_disconnect(display)
+        });
+        let mut window = Self {
+            state: Box::new(ClientState::new(*display, width, height)),
+            egl_display: ptr::null_mut(),
+            egl_surface: ptr::null_mut(),
+            egl_context: ptr::null_mut(),
+            hdr: None,
+            hdr_colors: None,
+        };
+        let display = DropGuard::dismiss(display);
+        let state = &mut window.state;
+        let state_ptr = state.as_mut() as *mut ClientState;
+
+        state.registry = unsafe { display_get_registry(display) };
+        if state.registry.is_null() {
+            return Err("could not get the Wayland registry".to_string());
+        }
+
         unsafe {
-            let display = wayland::wl_display_connect(ptr::null());
-            if display.is_null() {
-                return Err("could not connect to a Wayland compositor".to_string());
-            }
-
-            let mut state = Box::new(ClientState::new(display, width, height));
-            let state_ptr = state.as_mut() as *mut ClientState;
-
-            state.registry = display_get_registry(display);
-            if state.registry.is_null() {
-                wayland::wl_display_disconnect(display);
-                return Err("could not get the Wayland registry".to_string());
-            }
-
             wayland::wl_proxy_add_listener(
                 state.registry.cast(),
                 (&REGISTRY_LISTENER as *const wayland::WlRegistryListener).cast(),
                 state_ptr.cast(),
-            );
+            )
+        };
 
-            if wayland::wl_display_roundtrip(display) < 0 {
-                wayland::wl_display_disconnect(display);
-                return Err("Wayland registry roundtrip failed".to_string());
-            }
+        if unsafe { wayland::wl_display_roundtrip(display) } < 0 {
+            return Err("Wayland registry roundtrip failed".to_string());
+        }
 
-            if state.compositor.is_null() {
-                wayland::wl_display_disconnect(display);
-                return Err("Wayland compositor does not expose wl_compositor".to_string());
-            }
+        if state.compositor.is_null() {
+            return Err("Wayland compositor does not expose wl_compositor".to_string());
+        }
 
-            if state.wm_base.is_null() {
-                wayland::wl_display_disconnect(display);
-                return Err("Wayland compositor does not expose xdg_wm_base".to_string());
-            }
+        if state.wm_base.is_null() {
+            return Err("Wayland compositor does not expose xdg_wm_base".to_string());
+        }
 
-            state.surface = compositor_create_surface(state.compositor);
-            if state.surface.is_null() {
-                wayland::wl_display_disconnect(display);
-                return Err("could not create a Wayland surface".to_string());
-            }
+        state.surface = unsafe { compositor_create_surface(state.compositor) };
+        if state.surface.is_null() {
+            return Err("could not create a Wayland surface".to_string());
+        }
 
-            state.xdg_surface =
-                xdg_wm_base_get_xdg_surface(state.wm_base, state.xdg.surface, state.surface);
-            if state.xdg_surface.is_null() {
-                wayland::wl_display_disconnect(display);
-                return Err("could not create an xdg_surface".to_string());
-            }
+        state.xdg_surface =
+            unsafe { xdg_wm_base_get_xdg_surface(state.wm_base, state.xdg.surface, state.surface) };
+        if state.xdg_surface.is_null() {
+            return Err("could not create an xdg_surface".to_string());
+        }
 
+        unsafe {
             wayland::wl_proxy_add_listener(
                 state.xdg_surface,
                 (&XDG_SURFACE_LISTENER as *const XdgSurfaceListener).cast(),
                 state_ptr.cast(),
-            );
+            )
+        };
 
-            state.xdg_toplevel = xdg_surface_get_toplevel(state.xdg_surface, state.xdg.toplevel);
-            if state.xdg_toplevel.is_null() {
-                wayland::wl_display_disconnect(display);
-                return Err("could not create an xdg_toplevel".to_string());
-            }
+        state.xdg_toplevel =
+            unsafe { xdg_surface_get_toplevel(state.xdg_surface, state.xdg.toplevel) };
+        if state.xdg_toplevel.is_null() {
+            return Err("could not create an xdg_toplevel".to_string());
+        }
 
+        unsafe {
             wayland::wl_proxy_add_listener(
                 state.xdg_toplevel,
                 (&XDG_TOPLEVEL_LISTENER as *const XdgToplevelListener).cast(),
                 state_ptr.cast(),
-            );
+            )
+        };
 
-            if !state.decoration_manager.is_null() {
-                state.toplevel_decoration = decoration_manager_get_toplevel_decoration(
+        if !state.decoration_manager.is_null() {
+            state.toplevel_decoration = unsafe {
+                decoration_manager_get_toplevel_decoration(
                     state.decoration_manager,
                     state.xdg.toplevel_decoration,
                     state.xdg_toplevel,
-                );
-                if !state.toplevel_decoration.is_null() {
+                )
+            };
+            if !state.toplevel_decoration.is_null() {
+                unsafe {
                     wayland::wl_proxy_add_listener(
                         state.toplevel_decoration,
                         (&TOPLEVEL_DECORATION_LISTENER as *const ToplevelDecorationListener).cast(),
                         state_ptr.cast(),
-                    );
+                    )
+                };
+                unsafe {
                     toplevel_decoration_set_mode(
                         state.toplevel_decoration,
                         ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE,
-                    );
-                }
+                    )
+                };
             }
-
-            let title = CString::new(title).map_err(|_| "window title contains NUL")?;
-            xdg_toplevel_set_title(state.xdg_toplevel, title.as_ptr());
-            let app_id = CString::new("glmatrix-rs").unwrap();
-            xdg_toplevel_set_app_id(state.xdg_toplevel, app_id.as_ptr());
-            surface_commit(state.surface);
-
-            loop {
-                if (*state_ptr).configured {
-                    break;
-                }
-                if wayland::wl_display_dispatch(display) < 0 {
-                    wayland::wl_display_disconnect(display);
-                    return Err("Wayland dispatch failed while waiting for configure".to_string());
-                }
-            }
-
-            let egl_display = egl::eglGetDisplay(display.cast());
-            if egl_display.is_null() {
-                wayland::wl_display_disconnect(display);
-                return Err("eglGetDisplay failed".to_string());
-            }
-
-            let mut major = 0;
-            let mut minor = 0;
-            if egl::eglInitialize(egl_display, &mut major, &mut minor) == egl::EGL_FALSE {
-                wayland::wl_display_disconnect(display);
-                return Err(format!("eglInitialize failed: 0x{:x}", egl::eglGetError()));
-            }
-
-            if egl::eglBindAPI(egl::EGL_OPENGL_API) == egl::EGL_FALSE {
-                egl::eglTerminate(egl_display);
-                wayland::wl_display_disconnect(display);
-                return Err(format!(
-                    "eglBindAPI(EGL_OPENGL_API) failed: 0x{:x}",
-                    egl::eglGetError()
-                ));
-            }
-
-            let mut window = Self {
-                state,
-                egl_display,
-                egl_surface: ptr::null_mut(),
-                egl_context: ptr::null_mut(),
-                hdr: None,
-                hdr_colors: None,
-            };
-            window.init_rendering(hdr_mode)?;
-            Ok(window)
         }
+
+        let title = CString::new(title).map_err(|_| "window title contains NUL")?;
+        unsafe { xdg_toplevel_set_title(state.xdg_toplevel, title.as_ptr()) };
+        let app_id = CString::new("glmatrix-rs").unwrap();
+        unsafe { xdg_toplevel_set_app_id(state.xdg_toplevel, app_id.as_ptr()) };
+        unsafe { surface_commit(state.surface) };
+
+        loop {
+            if state.configured {
+                break;
+            }
+            if unsafe { wayland::wl_display_dispatch(display) } < 0 {
+                return Err("Wayland dispatch failed while waiting for configure".to_string());
+            }
+        }
+
+        let egl_display = unsafe { egl::eglGetDisplay(display.cast()) };
+        if egl_display.is_null() {
+            return Err("eglGetDisplay failed".to_string());
+        }
+
+        let mut major = 0;
+        let mut minor = 0;
+        if unsafe { egl::eglInitialize(egl_display, &mut major, &mut minor) } == egl::EGL_FALSE {
+            return Err(format!("eglInitialize failed: 0x{:x}", unsafe {
+                egl::eglGetError()
+            }));
+        }
+        window.egl_display = egl_display;
+
+        if unsafe { egl::eglBindAPI(egl::EGL_OPENGL_API) } == egl::EGL_FALSE {
+            return Err(format!(
+                "eglBindAPI(EGL_OPENGL_API) failed: 0x{:x}",
+                unsafe { egl::eglGetError() }
+            ));
+        }
+
+        unsafe { window.init_rendering(hdr_mode) }?;
+        Ok(window)
     }
 
     unsafe fn init_rendering(&mut self, mode: hdr::Mode) -> Result<(), String> {
-        self.state.egl_window = wayland_egl::wl_egl_window_create(
-            self.state.surface,
-            self.state.width as c_int,
-            self.state.height as c_int,
-        );
+        self.state.egl_window = unsafe {
+            wayland_egl::wl_egl_window_create(
+                self.state.surface,
+                self.state.width as c_int,
+                self.state.height as c_int,
+            )
+        };
         if self.state.egl_window.is_null() {
             return Err("wl_egl_window_create failed".into());
         }
 
         if mode != hdr::Mode::Off {
             let attempt = (|| {
-                let colors =
-                    hdr::ColorManagement::new(self.state.display, self.state.surface, mode)?;
-                let (config, format) = hdr::choose_config(self.egl_display)?;
-                self.create_rendering_context(config)?;
-                let renderer = hdr::Renderer::new(colors.peak(), self.size())?;
-                colors.activate();
+                let colors = unsafe {
+                    hdr::ColorManagement::new(self.state.display, self.state.surface, mode)
+                }?;
+                let (config, format) = unsafe { hdr::choose_config(self.egl_display) }?;
+                unsafe { self.create_rendering_context(config) }?;
+                let renderer = unsafe { hdr::Renderer::new(colors.peak(), self.size()) }?;
+                unsafe { colors.activate() };
                 self.hdr = Some(renderer);
                 self.hdr_colors = Some(colors);
                 Ok::<&str, String>(format)
@@ -2216,60 +2220,67 @@ impl WaylandWindow {
                     return Err(format!("HDR requested but unavailable: {error}"));
                 }
                 Err(error) => {
-                    self.clear_rendering_context();
-                    if wayland::wl_display_get_error(self.state.display) != 0 {
+                    unsafe { self.clear_rendering_context() };
+                    if unsafe { wayland::wl_display_get_error(self.state.display) } != 0 {
                         return Err(format!("Wayland color management failed: {error}"));
                     }
                     eprintln!("glmatrix-rs: HDR unavailable ({error}); using SDR");
                 }
             }
         }
-        let config = choose_egl_config(self.egl_display)?;
-        self.create_rendering_context(config)
+        let config = unsafe { choose_egl_config(self.egl_display) }?;
+        unsafe { self.create_rendering_context(config) }
     }
 
     unsafe fn create_rendering_context(&mut self, config: egl::EGLConfig) -> Result<(), String> {
-        self.egl_context = create_egl_context(self.egl_display, config)?;
-        self.egl_surface = egl::eglCreateWindowSurface(
-            self.egl_display,
-            config,
-            self.state.egl_window.cast(),
-            ptr::null(),
-        );
+        self.egl_context = unsafe { create_egl_context(self.egl_display, config) }?;
+        self.egl_surface = unsafe {
+            egl::eglCreateWindowSurface(
+                self.egl_display,
+                config,
+                self.state.egl_window.cast(),
+                ptr::null(),
+            )
+        };
         if self.egl_surface.is_null() {
-            return Err(format!(
-                "eglCreateWindowSurface failed: 0x{:x}",
+            return Err(format!("eglCreateWindowSurface failed: 0x{:x}", unsafe {
                 egl::eglGetError()
-            ));
+            }));
         }
-        if egl::eglMakeCurrent(
-            self.egl_display,
-            self.egl_surface,
-            self.egl_surface,
-            self.egl_context,
-        ) == egl::EGL_FALSE
+        if unsafe {
+            egl::eglMakeCurrent(
+                self.egl_display,
+                self.egl_surface,
+                self.egl_surface,
+                self.egl_context,
+            )
+        } == egl::EGL_FALSE
         {
-            return Err(format!("eglMakeCurrent failed: 0x{:x}", egl::eglGetError()));
+            return Err(format!("eglMakeCurrent failed: 0x{:x}", unsafe {
+                egl::eglGetError()
+            }));
         }
-        egl::eglSwapInterval(self.egl_display, 1);
+        unsafe { egl::eglSwapInterval(self.egl_display, 1) };
         Ok(())
     }
 
     unsafe fn clear_rendering_context(&mut self) {
         self.hdr.take();
         self.hdr_colors.take();
-        egl::eglMakeCurrent(
-            self.egl_display,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-        );
+        unsafe {
+            egl::eglMakeCurrent(
+                self.egl_display,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
         if !self.egl_surface.is_null() {
-            egl::eglDestroySurface(self.egl_display, self.egl_surface);
+            unsafe { egl::eglDestroySurface(self.egl_display, self.egl_surface) };
             self.egl_surface = ptr::null_mut();
         }
         if !self.egl_context.is_null() {
-            egl::eglDestroyContext(self.egl_display, self.egl_context);
+            unsafe { egl::eglDestroyContext(self.egl_display, self.egl_context) };
             self.egl_context = ptr::null_mut();
         }
     }
@@ -2293,40 +2304,38 @@ impl WaylandWindow {
     }
 
     fn poll_events(&mut self, matrix: &mut Matrix) -> bool {
-        unsafe {
-            while wayland::wl_display_dispatch_pending(self.state.display) > 0 {}
-            self.apply_state(matrix);
+        while unsafe { wayland::wl_display_dispatch_pending(self.state.display) } > 0 {}
+        self.apply_state(matrix);
 
-            wayland::wl_display_flush(self.state.display);
-            if wayland::wl_display_prepare_read(self.state.display) == 0 {
-                wayland::wl_display_flush(self.state.display);
-                let fd = wayland::wl_display_get_fd(self.state.display);
-                let mut poll_fd = PollFd {
-                    fd,
-                    events: POLLIN,
-                    revents: 0,
-                };
+        unsafe { wayland::wl_display_flush(self.state.display) };
+        if unsafe { wayland::wl_display_prepare_read(self.state.display) } == 0 {
+            unsafe { wayland::wl_display_flush(self.state.display) };
+            let fd = unsafe { wayland::wl_display_get_fd(self.state.display) };
+            let mut poll_fd = PollFd {
+                fd,
+                events: POLLIN,
+                revents: 0,
+            };
 
-                let ready = poll(&mut poll_fd, 1, 0);
-                if ready > 0 && (poll_fd.revents & POLLIN) != 0 {
-                    wayland::wl_display_read_events(self.state.display);
-                } else {
-                    wayland::wl_display_cancel_read(self.state.display);
-                }
+            let ready = unsafe { poll(&mut poll_fd, 1, 0) };
+            if ready > 0 && (poll_fd.revents & POLLIN) != 0 {
+                unsafe { wayland::wl_display_read_events(self.state.display) };
+            } else {
+                unsafe { wayland::wl_display_cancel_read(self.state.display) };
             }
-
-            while wayland::wl_display_dispatch_pending(self.state.display) > 0 {}
-            self.apply_state(matrix);
-
-            let running =
-                self.state.running && wayland::wl_display_get_error(self.state.display) == 0;
-            if running {
-                // Coalesce key presses and process queued configures before
-                // sending at most one request for the latest desired state.
-                self.state.send_pending_fullscreen();
-            }
-            running && self.state.running
         }
+
+        while unsafe { wayland::wl_display_dispatch_pending(self.state.display) } > 0 {}
+        self.apply_state(matrix);
+
+        let running =
+            self.state.running && unsafe { wayland::wl_display_get_error(self.state.display) } == 0;
+        if running {
+            // Coalesce key presses and process queued configures before
+            // sending at most one request for the latest desired state.
+            unsafe { self.state.send_pending_fullscreen() };
+        }
+        running && self.state.running
     }
 
     fn apply_state(&mut self, matrix: &mut Matrix) {
@@ -2437,14 +2446,13 @@ unsafe fn choose_egl_config(display: egl::EGLDisplay) -> Result<egl::EGLConfig, 
     let mut config = ptr::null_mut();
     let mut count = 0;
 
-    if egl::eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count)
+    if unsafe { egl::eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count) }
         == egl::EGL_FALSE
         || count == 0
     {
-        return Err(format!(
-            "eglChooseConfig failed: 0x{:x}",
+        return Err(format!("eglChooseConfig failed: 0x{:x}", unsafe {
             egl::eglGetError()
-        ));
+        }));
     }
 
     Ok(config)
@@ -2461,33 +2469,36 @@ unsafe fn create_egl_context(
         1,
         egl::EGL_NONE,
     ];
-    let mut context = egl::eglCreateContext(display, config, ptr::null_mut(), attributes.as_ptr());
+    let mut context =
+        unsafe { egl::eglCreateContext(display, config, ptr::null_mut(), attributes.as_ptr()) };
 
     if context.is_null() {
         let fallback = [egl::EGL_NONE];
-        context = egl::eglCreateContext(display, config, ptr::null_mut(), fallback.as_ptr());
+        context =
+            unsafe { egl::eglCreateContext(display, config, ptr::null_mut(), fallback.as_ptr()) };
     }
 
     if context.is_null() {
-        return Err(format!(
-            "eglCreateContext failed: 0x{:x}",
+        return Err(format!("eglCreateContext failed: 0x{:x}", unsafe {
             egl::eglGetError()
-        ));
+        }));
     }
 
     Ok(context)
 }
 
 unsafe fn display_get_registry(display: *mut wayland::WlDisplay) -> *mut wayland::WlRegistry {
-    wayland::wl_proxy_marshal_flags(
-        display.cast(),
-        wayland::WL_DISPLAY_GET_REGISTRY,
-        &wayland::wl_registry_interface,
-        wayland::wl_proxy_get_version(display.cast()),
-        0,
-        ptr::null_mut::<c_void>(),
-    )
-    .cast()
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            display.cast(),
+            wayland::WL_DISPLAY_GET_REGISTRY,
+            &raw const wayland::wl_registry_interface,
+            wayland::wl_proxy_get_version(display.cast()),
+            0,
+            ptr::null_mut::<c_void>(),
+        )
+        .cast()
+    }
 }
 
 unsafe fn registry_bind(
@@ -2496,41 +2507,47 @@ unsafe fn registry_bind(
     interface: *const wayland::WlInterface,
     version: u32,
 ) -> *mut wayland::WlProxy {
-    wayland::wl_proxy_marshal_flags(
-        registry.cast(),
-        wayland::WL_REGISTRY_BIND,
-        interface,
-        version,
-        0,
-        name,
-        (*interface).name,
-        version,
-        ptr::null_mut::<c_void>(),
-    )
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            registry.cast(),
+            wayland::WL_REGISTRY_BIND,
+            interface,
+            version,
+            0,
+            name,
+            (*interface).name,
+            version,
+            ptr::null_mut::<c_void>(),
+        )
+    }
 }
 
 unsafe fn compositor_create_surface(
     compositor: *mut wayland::WlCompositor,
 ) -> *mut wayland::WlSurface {
-    wayland::wl_proxy_marshal_flags(
-        compositor.cast(),
-        wayland::WL_COMPOSITOR_CREATE_SURFACE,
-        &wayland::wl_surface_interface,
-        wayland::wl_proxy_get_version(compositor.cast()),
-        0,
-        ptr::null_mut::<c_void>(),
-    )
-    .cast()
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            compositor.cast(),
+            wayland::WL_COMPOSITOR_CREATE_SURFACE,
+            &raw const wayland::wl_surface_interface,
+            wayland::wl_proxy_get_version(compositor.cast()),
+            0,
+            ptr::null_mut::<c_void>(),
+        )
+        .cast()
+    }
 }
 
 unsafe fn surface_commit(surface: *mut wayland::WlSurface) {
-    wayland::wl_proxy_marshal_flags(
-        surface.cast(),
-        wayland::WL_SURFACE_COMMIT,
-        ptr::null(),
-        wayland::wl_proxy_get_version(surface.cast()),
-        0,
-    );
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            surface.cast(),
+            wayland::WL_SURFACE_COMMIT,
+            ptr::null(),
+            wayland::wl_proxy_get_version(surface.cast()),
+            0,
+        );
+    }
 }
 
 unsafe fn xdg_wm_base_get_xdg_surface(
@@ -2538,73 +2555,85 @@ unsafe fn xdg_wm_base_get_xdg_surface(
     xdg_surface_interface: *const wayland::WlInterface,
     surface: *mut wayland::WlSurface,
 ) -> *mut wayland::WlProxy {
-    wayland::wl_proxy_marshal_flags(
-        wm_base,
-        XDG_WM_BASE_GET_XDG_SURFACE,
-        xdg_surface_interface,
-        wayland::wl_proxy_get_version(wm_base),
-        0,
-        ptr::null_mut::<c_void>(),
-        surface,
-    )
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            wm_base,
+            XDG_WM_BASE_GET_XDG_SURFACE,
+            xdg_surface_interface,
+            wayland::wl_proxy_get_version(wm_base),
+            0,
+            ptr::null_mut::<c_void>(),
+            surface,
+        )
+    }
 }
 
 unsafe fn xdg_wm_base_pong(wm_base: *mut wayland::WlProxy, serial: u32) {
-    wayland::wl_proxy_marshal_flags(
-        wm_base,
-        XDG_WM_BASE_PONG,
-        ptr::null(),
-        wayland::wl_proxy_get_version(wm_base),
-        0,
-        serial,
-    );
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            wm_base,
+            XDG_WM_BASE_PONG,
+            ptr::null(),
+            wayland::wl_proxy_get_version(wm_base),
+            0,
+            serial,
+        );
+    }
 }
 
 unsafe fn xdg_surface_get_toplevel(
     xdg_surface: *mut wayland::WlProxy,
     xdg_toplevel_interface: *const wayland::WlInterface,
 ) -> *mut wayland::WlProxy {
-    wayland::wl_proxy_marshal_flags(
-        xdg_surface,
-        XDG_SURFACE_GET_TOPLEVEL,
-        xdg_toplevel_interface,
-        wayland::wl_proxy_get_version(xdg_surface),
-        0,
-        ptr::null_mut::<c_void>(),
-    )
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            xdg_surface,
+            XDG_SURFACE_GET_TOPLEVEL,
+            xdg_toplevel_interface,
+            wayland::wl_proxy_get_version(xdg_surface),
+            0,
+            ptr::null_mut::<c_void>(),
+        )
+    }
 }
 
 unsafe fn xdg_surface_ack_configure(xdg_surface: *mut wayland::WlProxy, serial: u32) {
-    wayland::wl_proxy_marshal_flags(
-        xdg_surface,
-        XDG_SURFACE_ACK_CONFIGURE,
-        ptr::null(),
-        wayland::wl_proxy_get_version(xdg_surface),
-        0,
-        serial,
-    );
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            xdg_surface,
+            XDG_SURFACE_ACK_CONFIGURE,
+            ptr::null(),
+            wayland::wl_proxy_get_version(xdg_surface),
+            0,
+            serial,
+        );
+    }
 }
 
 unsafe fn xdg_toplevel_set_title(toplevel: *mut wayland::WlProxy, title: *const c_char) {
-    wayland::wl_proxy_marshal_flags(
-        toplevel,
-        XDG_TOPLEVEL_SET_TITLE,
-        ptr::null(),
-        wayland::wl_proxy_get_version(toplevel),
-        0,
-        title,
-    );
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            toplevel,
+            XDG_TOPLEVEL_SET_TITLE,
+            ptr::null(),
+            wayland::wl_proxy_get_version(toplevel),
+            0,
+            title,
+        );
+    }
 }
 
 unsafe fn xdg_toplevel_set_app_id(toplevel: *mut wayland::WlProxy, app_id: *const c_char) {
-    wayland::wl_proxy_marshal_flags(
-        toplevel,
-        XDG_TOPLEVEL_SET_APP_ID,
-        ptr::null(),
-        wayland::wl_proxy_get_version(toplevel),
-        0,
-        app_id,
-    );
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            toplevel,
+            XDG_TOPLEVEL_SET_APP_ID,
+            ptr::null(),
+            wayland::wl_proxy_get_version(toplevel),
+            0,
+            app_id,
+        );
+    }
 }
 
 unsafe fn xdg_toplevel_move(
@@ -2612,15 +2641,17 @@ unsafe fn xdg_toplevel_move(
     seat: *mut wayland::WlSeat,
     serial: u32,
 ) {
-    wayland::wl_proxy_marshal_flags(
-        toplevel,
-        XDG_TOPLEVEL_MOVE,
-        ptr::null(),
-        wayland::wl_proxy_get_version(toplevel),
-        0,
-        seat,
-        serial,
-    );
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            toplevel,
+            XDG_TOPLEVEL_MOVE,
+            ptr::null(),
+            wayland::wl_proxy_get_version(toplevel),
+            0,
+            seat,
+            serial,
+        );
+    }
 }
 
 unsafe fn xdg_toplevel_resize(
@@ -2629,37 +2660,43 @@ unsafe fn xdg_toplevel_resize(
     serial: u32,
     edges: u32,
 ) {
-    wayland::wl_proxy_marshal_flags(
-        toplevel,
-        XDG_TOPLEVEL_RESIZE,
-        ptr::null(),
-        wayland::wl_proxy_get_version(toplevel),
-        0,
-        seat,
-        serial,
-        edges,
-    );
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            toplevel,
+            XDG_TOPLEVEL_RESIZE,
+            ptr::null(),
+            wayland::wl_proxy_get_version(toplevel),
+            0,
+            seat,
+            serial,
+            edges,
+        );
+    }
 }
 
 unsafe fn xdg_toplevel_set_fullscreen(toplevel: *mut wayland::WlProxy) {
-    wayland::wl_proxy_marshal_flags(
-        toplevel,
-        XDG_TOPLEVEL_SET_FULLSCREEN,
-        ptr::null(),
-        wayland::wl_proxy_get_version(toplevel),
-        0,
-        ptr::null_mut::<c_void>(),
-    );
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            toplevel,
+            XDG_TOPLEVEL_SET_FULLSCREEN,
+            ptr::null(),
+            wayland::wl_proxy_get_version(toplevel),
+            0,
+            ptr::null_mut::<c_void>(),
+        );
+    }
 }
 
 unsafe fn xdg_toplevel_unset_fullscreen(toplevel: *mut wayland::WlProxy) {
-    wayland::wl_proxy_marshal_flags(
-        toplevel,
-        XDG_TOPLEVEL_UNSET_FULLSCREEN,
-        ptr::null(),
-        wayland::wl_proxy_get_version(toplevel),
-        0,
-    );
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            toplevel,
+            XDG_TOPLEVEL_UNSET_FULLSCREEN,
+            ptr::null(),
+            wayland::wl_proxy_get_version(toplevel),
+            0,
+        );
+    }
 }
 
 unsafe fn decoration_manager_get_toplevel_decoration(
@@ -2667,62 +2704,70 @@ unsafe fn decoration_manager_get_toplevel_decoration(
     decoration_interface: *const wayland::WlInterface,
     toplevel: *mut wayland::WlProxy,
 ) -> *mut wayland::WlProxy {
-    wayland::wl_proxy_marshal_flags(
-        manager,
-        ZXDG_DECORATION_MANAGER_V1_GET_TOPLEVEL_DECORATION,
-        decoration_interface,
-        wayland::wl_proxy_get_version(manager),
-        0,
-        ptr::null_mut::<c_void>(),
-        toplevel,
-    )
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            manager,
+            ZXDG_DECORATION_MANAGER_V1_GET_TOPLEVEL_DECORATION,
+            decoration_interface,
+            wayland::wl_proxy_get_version(manager),
+            0,
+            ptr::null_mut::<c_void>(),
+            toplevel,
+        )
+    }
 }
 
 unsafe fn toplevel_decoration_set_mode(decoration: *mut wayland::WlProxy, mode: u32) {
-    wayland::wl_proxy_marshal_flags(
-        decoration,
-        ZXDG_TOPLEVEL_DECORATION_V1_SET_MODE,
-        ptr::null(),
-        wayland::wl_proxy_get_version(decoration),
-        0,
-        mode,
-    );
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            decoration,
+            ZXDG_TOPLEVEL_DECORATION_V1_SET_MODE,
+            ptr::null(),
+            wayland::wl_proxy_get_version(decoration),
+            0,
+            mode,
+        );
+    }
 }
 
 unsafe fn release_input_proxy(proxy: *mut wayland::WlProxy, opcode: u32, since: u32) {
     if proxy.is_null() {
         return;
     }
-    let version = wayland::wl_proxy_get_version(proxy);
+    let version = unsafe { wayland::wl_proxy_get_version(proxy) };
     if version >= since {
-        wayland::wl_proxy_marshal_flags(proxy, opcode, ptr::null(), version, 1);
+        unsafe { wayland::wl_proxy_marshal_flags(proxy, opcode, ptr::null(), version, 1) };
     } else {
-        wayland::wl_proxy_destroy(proxy);
+        unsafe { wayland::wl_proxy_destroy(proxy) };
     }
 }
 
 unsafe fn seat_get_keyboard(seat: *mut wayland::WlSeat) -> *mut wayland::WlKeyboard {
-    wayland::wl_proxy_marshal_flags(
-        seat.cast(),
-        wayland::WL_SEAT_GET_KEYBOARD,
-        &wayland::wl_keyboard_interface,
-        wayland::wl_proxy_get_version(seat.cast()),
-        0,
-        ptr::null_mut::<c_void>(),
-    )
-    .cast()
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            seat.cast(),
+            wayland::WL_SEAT_GET_KEYBOARD,
+            &raw const wayland::wl_keyboard_interface,
+            wayland::wl_proxy_get_version(seat.cast()),
+            0,
+            ptr::null_mut::<c_void>(),
+        )
+        .cast()
+    }
 }
 
 unsafe fn seat_get_pointer(seat: *mut wayland::WlSeat) -> *mut wayland::WlPointer {
-    wayland::wl_proxy_marshal_flags(
-        seat.cast(),
-        wayland::WL_SEAT_GET_POINTER,
-        &wayland::wl_pointer_interface,
-        wayland::wl_proxy_get_version(seat.cast()),
-        0,
-        ptr::null_mut::<c_void>(),
-    )
-    .cast()
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            seat.cast(),
+            wayland::WL_SEAT_GET_POINTER,
+            &raw const wayland::wl_pointer_interface,
+            wayland::wl_proxy_get_version(seat.cast()),
+            0,
+            ptr::null_mut::<c_void>(),
+        )
+        .cast()
+    }
 }
 
 const XDG_WM_BASE_GET_XDG_SURFACE: u32 = 2;
@@ -2811,31 +2856,42 @@ unsafe extern "C" fn registry_global(
     interface: *const c_char,
     version: u32,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
-    let interface = CStr::from_ptr(interface).to_string_lossy();
+    let state = unsafe { &mut *data.cast::<ClientState>() };
+    let interface = unsafe { CStr::from_ptr(interface) }.to_string_lossy();
 
     if interface == "wl_compositor" {
         let version = version.min(4);
-        state.compositor =
-            registry_bind(registry, name, &wayland::wl_compositor_interface, version).cast();
+        state.compositor = unsafe {
+            registry_bind(
+                registry,
+                name,
+                &raw const wayland::wl_compositor_interface,
+                version,
+            )
+        }
+        .cast();
     } else if interface == "wl_shm" {
-        state.shm = registry_bind(registry, name, &wayland::wl_shm_interface, 1).cast();
+        state.shm =
+            unsafe { registry_bind(registry, name, &raw const wayland::wl_shm_interface, 1) }
+                .cast();
     } else if interface == "xdg_wm_base" {
         let version = version.min(6);
-        state.wm_base = registry_bind(registry, name, state.xdg.wm_base, version);
-        wayland::wl_proxy_add_listener(
-            state.wm_base,
-            (&XDG_WM_BASE_LISTENER as *const XdgWmBaseListener).cast(),
-            data,
-        );
+        state.wm_base = unsafe { registry_bind(registry, name, state.xdg.wm_base, version) };
+        unsafe {
+            wayland::wl_proxy_add_listener(
+                state.wm_base,
+                (&XDG_WM_BASE_LISTENER as *const XdgWmBaseListener).cast(),
+                data,
+            )
+        };
     } else if interface == "wl_seat" {
         state.available_seats.push((name, version));
         if state.seat.is_null() {
-            state.bind_seat(registry, name, version);
+            unsafe { state.bind_seat(registry, name, version) };
         }
     } else if interface == "zxdg_decoration_manager_v1" {
         state.decoration_manager =
-            registry_bind(registry, name, state.xdg.decoration_manager, version.min(1));
+            unsafe { registry_bind(registry, name, state.xdg.decoration_manager, version.min(1)) };
     }
 }
 
@@ -2844,18 +2900,18 @@ unsafe extern "C" fn registry_global_remove(
     registry: *mut wayland::WlRegistry,
     name: u32,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
+    let state = unsafe { &mut *data.cast::<ClientState>() };
     state
         .available_seats
         .retain(|&(seat_name, _)| seat_name != name);
     if state.seat_global_name == Some(name) {
-        state.release_pointer();
-        state.release_keyboard();
-        release_input_proxy(state.seat.cast(), 3, 5);
+        unsafe { state.release_pointer() };
+        unsafe { state.release_keyboard() };
+        unsafe { release_input_proxy(state.seat.cast(), 3, 5) };
         state.seat = ptr::null_mut();
         state.seat_global_name = None;
         if let Some(&(name, version)) = state.available_seats.first() {
-            state.bind_seat(registry, name, version);
+            unsafe { state.bind_seat(registry, name, version) };
         }
     }
 }
@@ -2865,7 +2921,9 @@ unsafe extern "C" fn xdg_wm_base_ping(
     wm_base: *mut wayland::WlProxy,
     serial: u32,
 ) {
-    xdg_wm_base_pong(wm_base, serial);
+    unsafe {
+        xdg_wm_base_pong(wm_base, serial);
+    }
 }
 
 unsafe extern "C" fn xdg_surface_configure(
@@ -2873,8 +2931,8 @@ unsafe extern "C" fn xdg_surface_configure(
     xdg_surface: *mut wayland::WlProxy,
     serial: u32,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
-    xdg_surface_ack_configure(xdg_surface, serial);
+    let state = unsafe { &mut *data.cast::<ClientState>() };
+    unsafe { xdg_surface_ack_configure(xdg_surface, serial) };
     state.apply_configure_size();
     state.configured = true;
     // EGL commits the resized buffer on the next swap. Committing here would
@@ -2888,11 +2946,13 @@ unsafe extern "C" fn xdg_toplevel_configure(
     height: c_int,
     states: *mut wayland::WlArray,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
+    let state = unsafe { &mut *data.cast::<ClientState>() };
     state.pending_fullscreen = false;
-    if !states.is_null() && !(*states).data.is_null() {
-        let len = (*states).size / mem::size_of::<u32>();
-        let values = std::slice::from_raw_parts((*states).data.cast::<u32>(), len);
+    if let Some(states) = unsafe { states.as_ref() }
+        && !states.data.is_null()
+    {
+        let len = states.size / mem::size_of::<u32>();
+        let values = unsafe { std::slice::from_raw_parts(states.data.cast::<u32>(), len) };
         state.pending_fullscreen = values.contains(&XDG_TOPLEVEL_STATE_FULLSCREEN);
     }
     let leaving_fullscreen = state.fullscreen && !state.pending_fullscreen;
@@ -2913,7 +2973,8 @@ unsafe extern "C" fn xdg_toplevel_configure(
 }
 
 unsafe extern "C" fn xdg_toplevel_close(data: *mut c_void, _toplevel: *mut wayland::WlProxy) {
-    (*(data.cast::<ClientState>())).running = false;
+    let state = unsafe { &mut *data.cast::<ClientState>() };
+    state.running = false;
 }
 
 unsafe extern "C" fn xdg_toplevel_configure_bounds(
@@ -2936,7 +2997,8 @@ unsafe extern "C" fn toplevel_decoration_configure(
     _decoration: *mut wayland::WlProxy,
     mode: u32,
 ) {
-    (*(data.cast::<ClientState>())).decoration_mode = mode;
+    let state = unsafe { &mut *data.cast::<ClientState>() };
+    state.decoration_mode = mode;
 }
 
 unsafe extern "C" fn seat_capabilities(
@@ -2944,37 +3006,41 @@ unsafe extern "C" fn seat_capabilities(
     seat: *mut wayland::WlSeat,
     capabilities: u32,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
+    let state = unsafe { &mut *data.cast::<ClientState>() };
     if seat != state.seat {
         return;
     }
 
     if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) == 0 {
-        state.release_keyboard();
+        unsafe { state.release_keyboard() };
     }
     if (capabilities & WL_SEAT_CAPABILITY_POINTER) == 0 {
-        state.release_pointer();
+        unsafe { state.release_pointer() };
     }
 
     if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) != 0 && state.keyboard.is_null() {
-        state.keyboard = seat_get_keyboard(seat);
+        state.keyboard = unsafe { seat_get_keyboard(seat) };
         if !state.keyboard.is_null() {
-            wayland::wl_proxy_add_listener(
-                state.keyboard.cast(),
-                (&KEYBOARD_LISTENER as *const wayland::WlKeyboardListener).cast(),
-                data,
-            );
+            unsafe {
+                wayland::wl_proxy_add_listener(
+                    state.keyboard.cast(),
+                    (&KEYBOARD_LISTENER as *const wayland::WlKeyboardListener).cast(),
+                    data,
+                )
+            };
         }
     }
 
     if (capabilities & WL_SEAT_CAPABILITY_POINTER) != 0 && state.pointer.is_null() {
-        state.pointer = seat_get_pointer(seat);
+        state.pointer = unsafe { seat_get_pointer(seat) };
         if !state.pointer.is_null() {
-            wayland::wl_proxy_add_listener(
-                state.pointer.cast(),
-                (&POINTER_LISTENER as *const wayland::WlPointerListener).cast(),
-                data,
-            );
+            unsafe {
+                wayland::wl_proxy_add_listener(
+                    state.pointer.cast(),
+                    (&POINTER_LISTENER as *const wayland::WlPointerListener).cast(),
+                    data,
+                )
+            };
         }
     }
 }
@@ -2993,8 +3059,8 @@ unsafe extern "C" fn keyboard_keymap(
     fd: c_int,
     size: u32,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
-    let file = File::from_raw_fd(fd);
+    let state = unsafe { &mut *data.cast::<ClientState>() };
+    let file = unsafe { File::from_raw_fd(fd) };
     state.keyboard_state = None;
     if format != 1 || size == 0 || size > 16 * 1024 * 1024 {
         eprintln!("unsupported Wayland keyboard keymap");
@@ -3008,7 +3074,7 @@ unsafe extern "C" fn keyboard_keymap(
     match keyboard::KeyboardState::new(&bytes) {
         Ok(keyboard) => state.keyboard_state = Some(keyboard),
         Err(error) => eprintln!("{error}"),
-    }
+    };
 }
 
 unsafe extern "C" fn keyboard_enter(
@@ -3018,7 +3084,7 @@ unsafe extern "C" fn keyboard_enter(
     _surface: *mut wayland::WlSurface,
     _keys: *mut wayland::WlArray,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
+    let state = unsafe { &mut *data.cast::<ClientState>() };
     state.focused = true;
     state.last_mouse_activity = Instant::now();
 }
@@ -3029,7 +3095,8 @@ unsafe extern "C" fn keyboard_leave(
     _serial: u32,
     _surface: *mut wayland::WlSurface,
 ) {
-    (*(data.cast::<ClientState>())).focused = false;
+    let state = unsafe { &mut *data.cast::<ClientState>() };
+    state.focused = false;
 }
 
 unsafe extern "C" fn keyboard_key(
@@ -3041,7 +3108,7 @@ unsafe extern "C" fn keyboard_key(
     state_value: u32,
 ) {
     if state_value == WL_KEYBOARD_KEY_STATE_PRESSED {
-        let state = &mut *(data.cast::<ClientState>());
+        let state = unsafe { &mut *data.cast::<ClientState>() };
         let action = state
             .keyboard_state
             .as_ref()
@@ -3064,7 +3131,7 @@ unsafe extern "C" fn keyboard_modifiers(
     mods_locked: u32,
     group: u32,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
+    let state = unsafe { &mut *data.cast::<ClientState>() };
     if let Some(keyboard) = &mut state.keyboard_state {
         keyboard.update_modifiers(mods_depressed, mods_latched, mods_locked, group);
     }
@@ -3086,14 +3153,14 @@ unsafe extern "C" fn pointer_enter(
     surface_x: wayland::WlFixed,
     surface_y: wayland::WlFixed,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
+    let state = unsafe { &mut *data.cast::<ClientState>() };
     state.update_pointer(surface_x, surface_y);
     state.pointer_enter_serial = Some(serial);
     if state.cursor.is_none() {
-        state.cursor = cursor::Cursor::new(state.compositor, state.shm);
+        state.cursor = unsafe { cursor::Cursor::new(state.compositor, state.shm) };
     }
     if let Some(cursor) = &state.cursor {
-        cursor.show(pointer, serial, state.pointer_on_close_button());
+        unsafe { cursor.show(pointer, serial, state.pointer_on_close_button()) };
     }
 }
 
@@ -3103,7 +3170,7 @@ unsafe extern "C" fn pointer_leave(
     _serial: u32,
     _surface: *mut wayland::WlSurface,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
+    let state = unsafe { &mut *data.cast::<ClientState>() };
     state.pointer_enter_serial = None;
     state.pointer_down = false;
     state.press_active = false;
@@ -3116,10 +3183,10 @@ unsafe extern "C" fn pointer_motion(
     surface_x: wayland::WlFixed,
     surface_y: wayland::WlFixed,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
+    let state = unsafe { &mut *data.cast::<ClientState>() };
     state.update_pointer(surface_x, surface_y);
     if state.pointer_down && state.press_active {
-        state.maybe_start_interactive_move();
+        unsafe { state.maybe_start_interactive_move() };
     }
     state.update_cursor();
 }
@@ -3132,7 +3199,7 @@ unsafe extern "C" fn pointer_button(
     button: u32,
     state_value: u32,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
+    let state = unsafe { &mut *data.cast::<ClientState>() };
     state.last_mouse_activity = Instant::now();
     state.update_cursor();
     if button == BTN_LEFT {
@@ -3155,7 +3222,7 @@ unsafe extern "C" fn pointer_button(
             if edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE {
                 state.pointer_down = false;
                 state.press_active = false;
-                state.start_interactive_resize(serial, edge);
+                unsafe { state.start_interactive_resize(serial, edge) };
                 return;
             }
 
@@ -3181,7 +3248,7 @@ unsafe extern "C" fn pointer_axis(
     _axis: u32,
     _value: wayland::WlFixed,
 ) {
-    let state = &mut *(data.cast::<ClientState>());
+    let state = unsafe { &mut *data.cast::<ClientState>() };
     state.last_mouse_activity = Instant::now();
     state.update_cursor();
 }
@@ -3466,7 +3533,7 @@ mod egl {
     unsafe extern "C" {
         pub fn eglGetDisplay(display_id: *mut c_void) -> EGLDisplay;
         pub fn eglInitialize(dpy: EGLDisplay, major: *mut EGLint, minor: *mut EGLint)
-            -> EGLBoolean;
+        -> EGLBoolean;
         pub fn eglTerminate(dpy: EGLDisplay) -> EGLBoolean;
         pub fn eglBindAPI(api: EGLenum) -> EGLBoolean;
         pub fn eglChooseConfig(

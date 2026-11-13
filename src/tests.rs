@@ -132,6 +132,27 @@ const KEYMAP: &str = r#"xkb_keymap {
 };"#;
 
 #[test]
+fn invalid_keymaps_do_not_affect_existing_keyboard_state() {
+    let keyboard = keyboard::KeyboardState::new(KEYMAP.as_bytes()).unwrap();
+    for keymap in [b"".as_slice(), b"invalid keymap", b"invalid keymap\0"] {
+        assert!(matches!(
+            keyboard::KeyboardState::new(keymap),
+            Err("could not compile keyboard keymap")
+        ));
+        assert_eq!(keyboard.action(16), Some(keyboard::Action::Quit));
+    }
+}
+
+#[test]
+fn clock_formats_handle_empty_invalid_and_oversized_output() {
+    assert_eq!(current_time_text("matrix"), "matrix");
+    assert_eq!(current_time_text(""), "");
+    assert_eq!(current_time_text("bad\0format"), "");
+    assert_eq!(current_time_text(&"a".repeat(127)), "a".repeat(127));
+    assert_eq!(current_time_text(&"a".repeat(128)), "");
+}
+
+#[test]
 fn shortcuts_follow_layout_and_modifiers() {
     use keyboard::Action;
     let mut keyboard = keyboard::KeyboardState::new(KEYMAP.as_bytes()).unwrap();
@@ -233,55 +254,57 @@ fn kana_atlas_contains_every_glyph_and_mirrors_exactly() {
 // and software renderer. LIBGL_ALWAYS_SOFTWARE alone does not select Mesa on
 // multi-vendor systems; the HDR fixtures require fixed 10-bit pbuffers.
 unsafe fn headless_window(width: i32, height: i32) -> WaylandWindow {
-    headless_window_with_bits(width, height, 8)
+    unsafe { headless_window_with_bits(width, height, 8) }
 }
 
 unsafe fn headless_window_with_bits(width: i32, height: i32, bits: i32) -> WaylandWindow {
-    let display = eglGetPlatformDisplay(0x31DD, ptr::null_mut(), ptr::null());
-    assert!(!display.is_null(), "surfaceless EGL display unavailable");
-    assert_ne!(
-        egl::eglInitialize(display, ptr::null_mut(), ptr::null_mut()),
-        0
-    );
-    assert_ne!(egl::eglBindAPI(egl::EGL_OPENGL_API), 0);
-    let attributes = [
-        egl::EGL_SURFACE_TYPE,
-        1,
-        egl::EGL_RENDERABLE_TYPE,
-        egl::EGL_OPENGL_BIT,
-        egl::EGL_RED_SIZE,
-        bits,
-        egl::EGL_GREEN_SIZE,
-        bits,
-        egl::EGL_BLUE_SIZE,
-        bits,
-        egl::EGL_ALPHA_SIZE,
-        if bits >= 10 { 2 } else { 8 },
-        egl::EGL_NONE,
-    ];
-    let mut config = ptr::null_mut();
-    let mut count = 0;
-    assert_ne!(
-        egl::eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count),
-        0
-    );
-    assert!(count > 0);
-    let context = create_egl_context(display, config).unwrap();
-    let size = [0x3057, width, 0x3056, height, egl::EGL_NONE];
-    let surface = eglCreatePbufferSurface(display, config, size.as_ptr());
-    assert!(!surface.is_null());
-    assert_ne!(egl::eglMakeCurrent(display, surface, surface, context), 0);
-    WaylandWindow {
-        state: Box::new(ClientState::new(
-            ptr::null_mut(),
-            width as u32,
-            height as u32,
-        )),
-        egl_display: display,
-        egl_surface: surface,
-        egl_context: context,
-        hdr: None,
-        hdr_colors: None,
+    unsafe {
+        let display = eglGetPlatformDisplay(0x31DD, ptr::null_mut(), ptr::null());
+        assert!(!display.is_null(), "surfaceless EGL display unavailable");
+        assert_ne!(
+            egl::eglInitialize(display, ptr::null_mut(), ptr::null_mut()),
+            0
+        );
+        assert_ne!(egl::eglBindAPI(egl::EGL_OPENGL_API), 0);
+        let attributes = [
+            egl::EGL_SURFACE_TYPE,
+            1,
+            egl::EGL_RENDERABLE_TYPE,
+            egl::EGL_OPENGL_BIT,
+            egl::EGL_RED_SIZE,
+            bits,
+            egl::EGL_GREEN_SIZE,
+            bits,
+            egl::EGL_BLUE_SIZE,
+            bits,
+            egl::EGL_ALPHA_SIZE,
+            if bits >= 10 { 2 } else { 8 },
+            egl::EGL_NONE,
+        ];
+        let mut config = ptr::null_mut();
+        let mut count = 0;
+        assert_ne!(
+            egl::eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count),
+            0
+        );
+        assert!(count > 0);
+        let context = create_egl_context(display, config).unwrap();
+        let size = [0x3057, width, 0x3056, height, egl::EGL_NONE];
+        let surface = eglCreatePbufferSurface(display, config, size.as_ptr());
+        assert!(!surface.is_null());
+        assert_ne!(egl::eglMakeCurrent(display, surface, surface, context), 0);
+        WaylandWindow {
+            state: Box::new(ClientState::new(
+                ptr::null_mut(),
+                width as u32,
+                height as u32,
+            )),
+            egl_display: display,
+            egl_surface: surface,
+            egl_context: context,
+            hdr: None,
+            hdr_colors: None,
+        }
     }
 }
 
@@ -315,11 +338,13 @@ fn decorations_preserve_opacity_and_window_coordinates() {
         }
         matrix.draw_client_border((640, 80), alpha);
         let expected = pixels(640, 80);
-        assert!(expected
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .all(|pixel| pixel[3] == 255));
+        assert!(
+            expected
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 255)
+        );
         unsafe {
             gl::glClear(gl::GL_COLOR_BUFFER_BIT);
         }
@@ -365,11 +390,13 @@ fn untextured_and_wireframe_rendering_apply_brightness_and_fog() {
             }
             matrix.draw_glyph(17, false, 1.0, 1.0, z, brightness, &mut 0);
             let pixels = pixels(64, 64);
-            assert!(pixels
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .all(|pixel| pixel[3] == 255));
+            assert!(
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[3] == 255)
+            );
             pixels
                 .as_chunks::<4>()
                 .0
@@ -955,9 +982,11 @@ fn pixel_from_top(bytes: &[u8], size: (u32, u32), x: u32, y: u32) -> [u8; 4] {
 }
 
 unsafe fn clear_rgba(r: f32, g: f32, b: f32, a: f32) {
-    gl::glClearColor(r, g, b, a);
-    gl::glClear(gl::GL_COLOR_BUFFER_BIT);
-    gl::glClearColor(0.0, 0.0, 0.0, 1.0);
+    unsafe {
+        gl::glClearColor(r, g, b, a);
+        gl::glClear(gl::GL_COLOR_BUFFER_BIT);
+        gl::glClearColor(0.0, 0.0, 0.0, 1.0);
+    }
 }
 
 #[test]
@@ -996,11 +1025,13 @@ fn hdr_faded_titlebar_does_not_dim_underlying_rain() {
             }
         }
         assert_eq!(pixel_from_top(&rendered, size, 4, 40), [0, 0, 0, 255]);
-        assert!(rendered
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .all(|pixel| pixel[3] == 255));
+        assert!(
+            rendered
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 255)
+        );
     }
 }
 

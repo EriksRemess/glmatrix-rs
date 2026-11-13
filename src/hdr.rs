@@ -3,9 +3,10 @@
 
 mod protocol;
 
-use super::{c_char, c_int, c_void, egl, gl, wayland, PollFd, POLLIN};
+use super::{POLLIN, PollFd, c_char, c_int, c_void, egl, gl, wayland};
 use std::cell::{Cell, RefCell};
 use std::ffi::CStr;
+use std::mem::DropGuard;
 use std::os::fd::FromRawFd;
 use std::ptr;
 use std::time::{Duration, Instant};
@@ -65,13 +66,14 @@ pub struct ColorManagement {
 }
 
 impl ColorManagement {
+    /// The display and surface must remain live until this object is dropped.
     pub unsafe fn new(
         display: *mut WlDisplay,
         surface: *mut WlSurface,
         mode: Mode,
     ) -> Result<Self, String> {
         let mut colors = Self {
-            registry: super::display_get_registry(display),
+            registry: unsafe { super::display_get_registry(display) },
             surface: ptr::null_mut(),
             feedback: ptr::null_mut(),
             description: ptr::null_mut(),
@@ -81,19 +83,21 @@ impl ColorManagement {
             peak: MAX_HIGHLIGHT,
         };
         let data = (&*colors.events as *const Events).cast_mut().cast();
-        listen(
-            colors.registry.cast(),
-            (&REGISTRY as *const wayland::WlRegistryListener).cast(),
-            data,
-        )?;
-        if wayland::wl_display_roundtrip(display) < 0 {
+        unsafe {
+            listen(
+                colors.registry.cast(),
+                (&REGISTRY as *const wayland::WlRegistryListener).cast(),
+                data,
+            )
+        }?;
+        if unsafe { wayland::wl_display_roundtrip(display) } < 0 {
             return Err("color-management registry roundtrip failed".into());
         }
         let manager = colors.events.manager.get();
         if manager.is_null() {
             return Err("compositor does not advertise wp_color_manager_v1".into());
         }
-        wait(display, || colors.events.capabilities_done.get())?;
+        unsafe { wait(display, || colors.events.capabilities_done.get()) }?;
         let e = &colors.events;
         if !has(e.features.get(), FEATURE_PARAMETRIC)
             || !has(e.features.get(), FEATURE_LUMINANCES)
@@ -104,43 +108,51 @@ impl ColorManagement {
             return Err("compositor lacks parametric BT.2020/PQ color management".into());
         }
         let p = protocol::interfaces();
-        colors.surface = wayland::wl_proxy_marshal_flags(
-            manager,
-            2,
-            p.surface,
-            1,
-            0,
-            ptr::null_mut::<c_void>(),
-            surface,
-        );
+        colors.surface = unsafe {
+            wayland::wl_proxy_marshal_flags(
+                manager,
+                2,
+                p.surface,
+                1,
+                0,
+                ptr::null_mut::<c_void>(),
+                surface,
+            )
+        };
         if colors.surface.is_null() {
             return Err("could not create a color-management surface".into());
         }
-        colors.feedback = wayland::wl_proxy_marshal_flags(
-            manager,
-            3,
-            p.feedback,
-            1,
-            0,
-            ptr::null_mut::<c_void>(),
-            surface,
-        );
-        listen(
-            colors.feedback,
-            (&FEEDBACK as *const FeedbackListener).cast(),
-            data,
-        )?;
-        colors.preferred = construct(colors.feedback, 2, p.description, 0);
-        listen(
-            colors.preferred,
-            (&DESCRIPTION as *const DescriptionListener).cast(),
-            data,
-        )?;
-        wait(display, || e.description_status.get() != 0)?;
+        colors.feedback = unsafe {
+            wayland::wl_proxy_marshal_flags(
+                manager,
+                3,
+                p.feedback,
+                1,
+                0,
+                ptr::null_mut::<c_void>(),
+                surface,
+            )
+        };
+        unsafe {
+            listen(
+                colors.feedback,
+                (&FEEDBACK as *const FeedbackListener).cast(),
+                data,
+            )
+        }?;
+        colors.preferred = unsafe { construct(colors.feedback, 2, p.description, 0) };
+        unsafe {
+            listen(
+                colors.preferred,
+                (&DESCRIPTION as *const DescriptionListener).cast(),
+                data,
+            )
+        }?;
+        unsafe { wait(display, || e.description_status.get() != 0) }?;
         if e.description_status.get() == 1 {
-            colors.info = construct(colors.preferred, 1, p.info, 0);
-            listen(colors.info, (&INFO as *const InfoListener).cast(), data)?;
-            wait(display, || e.info_done.get())?;
+            colors.info = unsafe { construct(colors.preferred, 1, p.info, 0) };
+            unsafe { listen(colors.info, (&INFO as *const InfoListener).cast(), data) }?;
+            unsafe { wait(display, || e.info_done.get()) }?;
             let maximum = if e.target.get() > 0 {
                 e.target.get()
             } else {
@@ -163,46 +175,52 @@ impl ColorManagement {
         }
         // A version-1 client may not understand a newer preferred description.
         // Explicit --hdr=on can still submit its own supported PQ description.
-        destroy(colors.preferred);
+        unsafe { destroy(colors.preferred) };
         colors.preferred = ptr::null_mut();
         e.description_status.set(0);
         e.failure.borrow_mut().clear();
-        let creator = construct(manager, 5, p.params, 0);
+        let creator = unsafe { construct(manager, 5, p.params, 0) };
         if creator.is_null() {
             return Err("could not create HDR image parameters".into());
         }
-        request_u32(creator, 1, TF_PQ);
-        request_u32(creator, 3, PRIMARIES_BT2020);
-        wayland::wl_proxy_marshal_flags(
-            creator,
-            5,
-            ptr::null(),
-            1,
-            0,
-            0_u32,
-            10_000_u32,
-            REFERENCE_WHITE,
-        );
-        if has(e.features.get(), FEATURE_MASTERING) {
+        unsafe { request_u32(creator, 1, TF_PQ) };
+        unsafe { request_u32(creator, 3, PRIMARIES_BT2020) };
+        unsafe {
             wayland::wl_proxy_marshal_flags(
                 creator,
-                7,
+                5,
                 ptr::null(),
                 1,
                 0,
                 0_u32,
-                colors.peak.ceil() as u32,
-            );
+                10_000_u32,
+                REFERENCE_WHITE,
+            )
+        };
+        if has(e.features.get(), FEATURE_MASTERING) {
+            unsafe {
+                wayland::wl_proxy_marshal_flags(
+                    creator,
+                    7,
+                    ptr::null(),
+                    1,
+                    0,
+                    0_u32,
+                    colors.peak.ceil() as u32,
+                )
+            };
         }
-        request_u32(creator, 8, colors.peak.ceil() as u32);
+        unsafe { request_u32(creator, 8, colors.peak.ceil() as u32) };
         // create is a destructor for the parameter builder.
-        colors.description = construct(creator, 0, p.description, 1);
-        listen(
-            colors.description,
-            (&DESCRIPTION as *const DescriptionListener).cast(),
-            data,
-        )?;
-        wait(display, || e.description_status.get() != 0)?;
+        colors.description = unsafe { construct(creator, 0, p.description, 1) };
+        unsafe {
+            listen(
+                colors.description,
+                (&DESCRIPTION as *const DescriptionListener).cast(),
+                data,
+            )
+        }?;
+        unsafe { wait(display, || e.description_status.get() != 0) }?;
         if e.description_status.get() != 1 {
             return Err(format!(
                 "compositor rejected HDR image description: {}",
@@ -217,16 +235,18 @@ impl ColorManagement {
     }
 
     pub unsafe fn activate(&self) {
-        // This state and the PQ buffer are applied together by EGL's next commit.
-        wayland::wl_proxy_marshal_flags(
-            self.surface,
-            1,
-            ptr::null(),
-            1,
-            0,
-            self.description,
-            0_u32,
-        );
+        unsafe {
+            // This state and the PQ buffer are applied together by EGL's next commit.
+            wayland::wl_proxy_marshal_flags(
+                self.surface,
+                1,
+                ptr::null(),
+                1,
+                0,
+                self.description,
+                0_u32,
+            );
+        }
     }
 }
 
@@ -258,7 +278,7 @@ unsafe fn listen(
     listener: *const c_void,
     data: *mut c_void,
 ) -> Result<(), String> {
-    if proxy.is_null() || wayland::wl_proxy_add_listener(proxy, listener, data) != 0 {
+    if proxy.is_null() || unsafe { wayland::wl_proxy_add_listener(proxy, listener, data) } != 0 {
         return Err("could not install color-management listener".into());
     }
     Ok(())
@@ -270,31 +290,35 @@ unsafe fn construct(
     interface: *const WlInterface,
     flags: u32,
 ) -> *mut WlProxy {
-    wayland::wl_proxy_marshal_flags(
-        proxy,
-        opcode,
-        interface,
-        1,
-        flags,
-        ptr::null_mut::<c_void>(),
-    )
+    unsafe {
+        wayland::wl_proxy_marshal_flags(
+            proxy,
+            opcode,
+            interface,
+            1,
+            flags,
+            ptr::null_mut::<c_void>(),
+        )
+    }
 }
 
 unsafe fn request_u32(proxy: *mut WlProxy, opcode: u32, value: u32) {
-    wayland::wl_proxy_marshal_flags(proxy, opcode, ptr::null(), 1, 0, value);
+    unsafe {
+        wayland::wl_proxy_marshal_flags(proxy, opcode, ptr::null(), 1, 0, value);
+    }
 }
 
 unsafe fn destroy(proxy: *mut WlProxy) {
     if !proxy.is_null() {
-        wayland::wl_proxy_marshal_flags(proxy, 0, ptr::null(), 1, 1);
+        unsafe { wayland::wl_proxy_marshal_flags(proxy, 0, ptr::null(), 1, 1) };
     }
 }
 
 unsafe fn wait(display: *mut WlDisplay, done: impl Fn() -> bool) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if wayland::wl_display_dispatch_pending(display) < 0
-            || wayland::wl_display_get_error(display) != 0
+        if unsafe { wayland::wl_display_dispatch_pending(display) } < 0
+            || unsafe { wayland::wl_display_get_error(display) } != 0
         {
             return Err("Wayland connection failed during HDR setup".into());
         }
@@ -304,22 +328,22 @@ unsafe fn wait(display: *mut WlDisplay, done: impl Fn() -> bool) -> Result<(), S
         if Instant::now() >= deadline {
             return Err("timed out waiting for color-management information".into());
         }
-        if wayland::wl_display_prepare_read(display) != 0 {
+        if unsafe { wayland::wl_display_prepare_read(display) } != 0 {
             continue;
         }
-        wayland::wl_display_flush(display);
+        unsafe { wayland::wl_display_flush(display) };
         let mut fd = PollFd {
-            fd: wayland::wl_display_get_fd(display),
+            fd: unsafe { wayland::wl_display_get_fd(display) },
             events: POLLIN,
             revents: 0,
         };
-        let ready = super::poll(&mut fd, 1, 100);
+        let ready = unsafe { super::poll(&mut fd, 1, 100) };
         if ready > 0 && fd.revents & POLLIN != 0 {
-            if wayland::wl_display_read_events(display) < 0 {
+            if unsafe { wayland::wl_display_read_events(display) } < 0 {
                 return Err("could not read Wayland HDR events".into());
             }
         } else {
-            wayland::wl_display_cancel_read(display);
+            unsafe { wayland::wl_display_cancel_read(display) };
             if ready > 0 && fd.revents != 0 {
                 return Err("Wayland connection closed during HDR setup".into());
             }
@@ -334,16 +358,19 @@ unsafe extern "C" fn global(
     interface: *const c_char,
     _version: u32,
 ) {
-    let e = &*data.cast::<Events>();
-    if CStr::from_ptr(interface) == c"wp_color_manager_v1" && e.manager.get().is_null() {
-        let manager = super::registry_bind(registry, name, protocol::interfaces().manager, 1);
+    let e = unsafe { &*data.cast::<Events>() };
+    if unsafe { CStr::from_ptr(interface) } == c"wp_color_manager_v1" && e.manager.get().is_null() {
+        let manager =
+            unsafe { super::registry_bind(registry, name, protocol::interfaces().manager, 1) };
         e.manager.set(manager);
         if !manager.is_null() {
-            wayland::wl_proxy_add_listener(
-                manager,
-                (&MANAGER as *const ManagerListener).cast(),
-                data,
-            );
+            unsafe {
+                wayland::wl_proxy_add_listener(
+                    manager,
+                    (&MANAGER as *const ManagerListener).cast(),
+                    data,
+                )
+            };
         }
     }
 }
@@ -374,19 +401,24 @@ fn add_bit(bits: &Cell<u32>, value: u32) {
 }
 
 unsafe extern "C" fn intent(data: *mut c_void, _: *mut WlProxy, value: u32) {
-    add_bit(&(*data.cast::<Events>()).intents, value);
+    let e = unsafe { &*data.cast::<Events>() };
+    add_bit(&e.intents, value);
 }
 unsafe extern "C" fn feature(data: *mut c_void, _: *mut WlProxy, value: u32) {
-    add_bit(&(*data.cast::<Events>()).features, value);
+    let e = unsafe { &*data.cast::<Events>() };
+    add_bit(&e.features, value);
 }
 unsafe extern "C" fn tf(data: *mut c_void, _: *mut WlProxy, value: u32) {
-    add_bit(&(*data.cast::<Events>()).transfer_functions, value);
+    let e = unsafe { &*data.cast::<Events>() };
+    add_bit(&e.transfer_functions, value);
 }
 unsafe extern "C" fn primaries(data: *mut c_void, _: *mut WlProxy, value: u32) {
-    add_bit(&(*data.cast::<Events>()).primaries, value);
+    let e = unsafe { &*data.cast::<Events>() };
+    add_bit(&e.primaries, value);
 }
 unsafe extern "C" fn manager_done(data: *mut c_void, _: *mut WlProxy) {
-    (*data.cast::<Events>()).capabilities_done.set(true);
+    let e = unsafe { &*data.cast::<Events>() };
+    e.capabilities_done.set(true);
 }
 
 static MANAGER: ManagerListener = ManagerListener {
@@ -414,12 +446,15 @@ struct DescriptionListener {
 }
 
 unsafe extern "C" fn failed(data: *mut c_void, _: *mut WlProxy, _: u32, message: *const c_char) {
-    let e = &*data.cast::<Events>();
-    *e.failure.borrow_mut() = CStr::from_ptr(message).to_string_lossy().into_owned();
+    let e = unsafe { &*data.cast::<Events>() };
+    *e.failure.borrow_mut() = unsafe { CStr::from_ptr(message) }
+        .to_string_lossy()
+        .into_owned();
     e.description_status.set(2);
 }
 unsafe extern "C" fn description_ready(data: *mut c_void, _: *mut WlProxy, _: u32) {
-    (*data.cast::<Events>()).description_status.set(1);
+    let e = unsafe { &*data.cast::<Events>() };
+    e.description_status.set(1);
 }
 static DESCRIPTION: DescriptionListener = DescriptionListener {
     failed,
@@ -443,11 +478,12 @@ struct InfoListener {
     max_fall: ValueEvent,
 }
 unsafe extern "C" fn info_done(data: *mut c_void, _: *mut WlProxy) {
-    (*data.cast::<Events>()).info_done.set(true);
+    let e = unsafe { &*data.cast::<Events>() };
+    e.info_done.set(true);
 }
 unsafe extern "C" fn ignore_icc(_: *mut c_void, _: *mut WlProxy, fd: c_int, _: u32) {
     if fd >= 0 {
-        drop(std::fs::File::from_raw_fd(fd));
+        drop(unsafe { std::fs::File::from_raw_fd(fd) });
     }
 }
 unsafe extern "C" fn ignore_primaries(
@@ -470,12 +506,13 @@ unsafe extern "C" fn luminances(
     maximum: u32,
     reference: u32,
 ) {
-    let e = &*data.cast::<Events>();
+    let e = unsafe { &*data.cast::<Events>() };
     e.maximum.set(maximum);
     e.reference.set(reference);
 }
 unsafe extern "C" fn target_luminance(data: *mut c_void, _: *mut WlProxy, _: u32, maximum: u32) {
-    (*data.cast::<Events>()).target.set(maximum);
+    let e = unsafe { &*data.cast::<Events>() };
+    e.target.set(maximum);
 }
 static INFO: InfoListener = InfoListener {
     done: info_done,
@@ -494,16 +531,16 @@ static INFO: InfoListener = InfoListener {
 pub unsafe fn choose_config(
     display: egl::EGLDisplay,
 ) -> Result<(egl::EGLConfig, &'static str), String> {
-    let extensions = eglQueryString(display, 0x3055); // EGL_EXTENSIONS
+    let extensions = unsafe { eglQueryString(display, 0x3055) }; // EGL_EXTENSIONS
     let supports_float = !extensions.is_null()
-        && CStr::from_ptr(extensions)
+        && unsafe { CStr::from_ptr(extensions) }
             .to_string_lossy()
             .split_ascii_whitespace()
             .any(|extension| extension == "EGL_EXT_pixel_format_float");
     select_config(supports_float, |attributes| {
         let mut config = ptr::null_mut();
         let mut count = 0;
-        if egl::eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count)
+        if unsafe { egl::eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count) }
             != egl::EGL_FALSE
             && count > 0
         {
@@ -569,12 +606,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// The current OpenGL context must remain current for use and destruction.
     pub unsafe fn new(peak: f32, size: (u32, u32)) -> Result<Self, String> {
-        let extensions = glGetString(0x1F03);
+        let extensions = unsafe { glGetString(0x1F03) };
         if extensions.is_null() {
             return Err("could not query OpenGL extensions".into());
         }
-        let extensions = CStr::from_ptr(extensions.cast()).to_string_lossy();
+        let extensions = unsafe { CStr::from_ptr(extensions.cast()) }.to_string_lossy();
         for required in [
             "GL_ARB_framebuffer_object",
             "GL_ARB_texture_float",
@@ -590,7 +628,7 @@ impl Renderer {
         let mut output_bits = i32::MAX;
         for channel in [0x0D52, 0x0D53, 0x0D54] {
             let mut bits = 0;
-            gl::glGetIntegerv(channel, &mut bits);
+            unsafe { gl::glGetIntegerv(channel, &mut bits) };
             if bits < 10 {
                 return Err("EGL window buffer has fewer than 10 bits per RGB channel".into());
             }
@@ -603,31 +641,33 @@ impl Renderer {
             decoration_texture: 0,
             size: (0, 0),
         };
-        renderer.program = program()?;
-        glUseProgram(renderer.program);
-        glUniform1i(glGetUniformLocation(renderer.program, c"scene".as_ptr()), 0);
-        glUniform1i(
-            glGetUniformLocation(renderer.program, c"decorations".as_ptr()),
-            1,
-        );
-        glUniform1f(
-            glGetUniformLocation(renderer.program, c"peak".as_ptr()),
-            peak,
-        );
+        renderer.program = unsafe { program() }?;
         let quantum = if output_bits >= 16 {
             0.0
         } else {
             1.0 / ((1_u32 << output_bits) - 1) as f32
         };
-        glUniform1f(
-            glGetUniformLocation(renderer.program, c"output_quantum".as_ptr()),
-            quantum,
-        );
-        glUseProgram(0);
-        gl::glGenTextures(1, &mut renderer.texture);
-        gl::glGenTextures(1, &mut renderer.decoration_texture);
-        glGenFramebuffers(1, &mut renderer.framebuffer);
-        renderer.resize(size)?;
+        unsafe {
+            glUseProgram(renderer.program);
+            glUniform1i(glGetUniformLocation(renderer.program, c"scene".as_ptr()), 0);
+            glUniform1i(
+                glGetUniformLocation(renderer.program, c"decorations".as_ptr()),
+                1,
+            );
+            glUniform1f(
+                glGetUniformLocation(renderer.program, c"peak".as_ptr()),
+                peak,
+            );
+            glUniform1f(
+                glGetUniformLocation(renderer.program, c"output_quantum".as_ptr()),
+                quantum,
+            );
+            glUseProgram(0);
+            gl::glGenTextures(1, &mut renderer.texture);
+            gl::glGenTextures(1, &mut renderer.decoration_texture);
+            glGenFramebuffers(1, &mut renderer.framebuffer);
+        }
+        unsafe { renderer.resize(size) }?;
         Ok(renderer)
     }
 
@@ -636,41 +676,50 @@ impl Renderer {
             return Ok(());
         }
         let mut maximum = 0;
-        gl::glGetIntegerv(0x0D33, &mut maximum); // GL_MAX_TEXTURE_SIZE
+        unsafe { gl::glGetIntegerv(0x0D33, &mut maximum) }; // GL_MAX_TEXTURE_SIZE
         if size.0 == 0 || size.1 == 0 || size.0 > maximum as u32 || size.1 > maximum as u32 {
             return Err("HDR framebuffer dimensions exceed the driver's texture limit".into());
         }
         for texture in [self.texture, self.decoration_texture] {
-            gl::glBindTexture(gl::GL_TEXTURE_2D, texture);
-            gl::glTexParameteri(
-                gl::GL_TEXTURE_2D,
-                gl::GL_TEXTURE_MIN_FILTER,
-                gl::GL_LINEAR as i32,
-            );
-            gl::glTexParameteri(
-                gl::GL_TEXTURE_2D,
-                gl::GL_TEXTURE_MAG_FILTER,
-                gl::GL_LINEAR as i32,
-            );
-            gl::glTexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_WRAP_S, CLAMP_TO_EDGE);
-            gl::glTexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_WRAP_T, CLAMP_TO_EDGE);
-            gl::glTexImage2D(
-                gl::GL_TEXTURE_2D,
-                0,
-                RGBA16F,
-                size.0 as i32,
-                size.1 as i32,
-                0,
-                gl::GL_RGBA,
-                FLOAT,
-                ptr::null(),
-            );
-            glBindFramebuffer(FRAMEBUFFER, self.framebuffer);
-            glFramebufferTexture2D(FRAMEBUFFER, COLOR_ATTACHMENT, gl::GL_TEXTURE_2D, texture, 0);
-            let status = glCheckFramebufferStatus(FRAMEBUFFER);
-            glBindFramebuffer(FRAMEBUFFER, 0);
-            gl::glBindTexture(gl::GL_TEXTURE_2D, 0);
-            let error = glGetError();
+            let (status, error) = unsafe {
+                gl::glBindTexture(gl::GL_TEXTURE_2D, texture);
+                gl::glTexParameteri(
+                    gl::GL_TEXTURE_2D,
+                    gl::GL_TEXTURE_MIN_FILTER,
+                    gl::GL_LINEAR as i32,
+                );
+                gl::glTexParameteri(
+                    gl::GL_TEXTURE_2D,
+                    gl::GL_TEXTURE_MAG_FILTER,
+                    gl::GL_LINEAR as i32,
+                );
+                gl::glTexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_WRAP_S, CLAMP_TO_EDGE);
+                gl::glTexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_WRAP_T, CLAMP_TO_EDGE);
+                gl::glTexImage2D(
+                    gl::GL_TEXTURE_2D,
+                    0,
+                    RGBA16F,
+                    size.0 as i32,
+                    size.1 as i32,
+                    0,
+                    gl::GL_RGBA,
+                    FLOAT,
+                    ptr::null(),
+                );
+                glBindFramebuffer(FRAMEBUFFER, self.framebuffer);
+                glFramebufferTexture2D(
+                    FRAMEBUFFER,
+                    COLOR_ATTACHMENT,
+                    gl::GL_TEXTURE_2D,
+                    texture,
+                    0,
+                );
+                let status = glCheckFramebufferStatus(FRAMEBUFFER);
+                glBindFramebuffer(FRAMEBUFFER, 0);
+                gl::glBindTexture(gl::GL_TEXTURE_2D, 0);
+                let error = glGetError();
+                (status, error)
+            };
             if status != FRAMEBUFFER_COMPLETE || error != 0 {
                 return Err(format!(
                     "HDR framebuffer allocation failed (status 0x{status:x}, GL 0x{error:x})"
@@ -682,61 +731,67 @@ impl Renderer {
     }
 
     pub unsafe fn begin(&mut self, size: (u32, u32)) -> Result<(), String> {
-        self.resize(size)?;
-        glBindFramebuffer(FRAMEBUFFER, self.framebuffer);
-        glFramebufferTexture2D(
-            FRAMEBUFFER,
-            COLOR_ATTACHMENT,
-            gl::GL_TEXTURE_2D,
-            self.texture,
-            0,
-        );
+        unsafe { self.resize(size) }?;
+        unsafe { glBindFramebuffer(FRAMEBUFFER, self.framebuffer) };
+        unsafe {
+            glFramebufferTexture2D(
+                FRAMEBUFFER,
+                COLOR_ATTACHMENT,
+                gl::GL_TEXTURE_2D,
+                self.texture,
+                0,
+            )
+        };
         Ok(())
     }
 
     pub unsafe fn begin_decorations(&self) {
-        glBindFramebuffer(FRAMEBUFFER, self.framebuffer);
-        glFramebufferTexture2D(
-            FRAMEBUFFER,
-            COLOR_ATTACHMENT,
-            gl::GL_TEXTURE_2D,
-            self.decoration_texture,
-            0,
-        );
-        gl::glColorMask(1, 1, 1, 1);
-        gl::glClearColor(0.0, 0.0, 0.0, 0.0);
-        gl::glClear(gl::GL_COLOR_BUFFER_BIT);
-        gl::glClearColor(0.0, 0.0, 0.0, 1.0);
+        unsafe {
+            glBindFramebuffer(FRAMEBUFFER, self.framebuffer);
+            glFramebufferTexture2D(
+                FRAMEBUFFER,
+                COLOR_ATTACHMENT,
+                gl::GL_TEXTURE_2D,
+                self.decoration_texture,
+                0,
+            );
+            gl::glColorMask(1, 1, 1, 1);
+            gl::glClearColor(0.0, 0.0, 0.0, 0.0);
+            gl::glClear(gl::GL_COLOR_BUFFER_BIT);
+            gl::glClearColor(0.0, 0.0, 0.0, 1.0);
+        }
     }
 
     pub unsafe fn present(&self) {
-        let mut viewport = [0; 4];
-        gl::glGetIntegerv(gl::GL_VIEWPORT, viewport.as_mut_ptr());
-        glBindFramebuffer(FRAMEBUFFER, 0);
-        gl::glViewport(0, 0, self.size.0 as i32, self.size.1 as i32);
-        gl::glDisable(gl::GL_BLEND);
-        gl::glDisable(gl::GL_DEPTH_TEST);
-        glActiveTexture(0x84C1); // GL_TEXTURE1
-        gl::glBindTexture(gl::GL_TEXTURE_2D, self.decoration_texture);
-        glActiveTexture(0x84C0); // GL_TEXTURE0
-        gl::glBindTexture(gl::GL_TEXTURE_2D, self.texture);
-        glUseProgram(self.program);
-        gl::glBegin(gl::GL_QUADS);
-        gl::glTexCoord2f(0.0, 0.0);
-        gl::glVertex3f(-1.0, -1.0, 0.0);
-        gl::glTexCoord2f(1.0, 0.0);
-        gl::glVertex3f(1.0, -1.0, 0.0);
-        gl::glTexCoord2f(1.0, 1.0);
-        gl::glVertex3f(1.0, 1.0, 0.0);
-        gl::glTexCoord2f(0.0, 1.0);
-        gl::glVertex3f(-1.0, 1.0, 0.0);
-        gl::glEnd();
-        glUseProgram(0);
-        glActiveTexture(0x84C1);
-        gl::glBindTexture(gl::GL_TEXTURE_2D, 0);
-        glActiveTexture(0x84C0);
-        gl::glBindTexture(gl::GL_TEXTURE_2D, 0);
-        gl::glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+        unsafe {
+            let mut viewport = [0; 4];
+            gl::glGetIntegerv(gl::GL_VIEWPORT, viewport.as_mut_ptr());
+            glBindFramebuffer(FRAMEBUFFER, 0);
+            gl::glViewport(0, 0, self.size.0 as i32, self.size.1 as i32);
+            gl::glDisable(gl::GL_BLEND);
+            gl::glDisable(gl::GL_DEPTH_TEST);
+            glActiveTexture(0x84C1); // GL_TEXTURE1
+            gl::glBindTexture(gl::GL_TEXTURE_2D, self.decoration_texture);
+            glActiveTexture(0x84C0); // GL_TEXTURE0
+            gl::glBindTexture(gl::GL_TEXTURE_2D, self.texture);
+            glUseProgram(self.program);
+            gl::glBegin(gl::GL_QUADS);
+            gl::glTexCoord2f(0.0, 0.0);
+            gl::glVertex3f(-1.0, -1.0, 0.0);
+            gl::glTexCoord2f(1.0, 0.0);
+            gl::glVertex3f(1.0, -1.0, 0.0);
+            gl::glTexCoord2f(1.0, 1.0);
+            gl::glVertex3f(1.0, 1.0, 0.0);
+            gl::glTexCoord2f(0.0, 1.0);
+            gl::glVertex3f(-1.0, 1.0, 0.0);
+            gl::glEnd();
+            glUseProgram(0);
+            glActiveTexture(0x84C1);
+            gl::glBindTexture(gl::GL_TEXTURE_2D, 0);
+            glActiveTexture(0x84C0);
+            gl::glBindTexture(gl::GL_TEXTURE_2D, 0);
+            gl::glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+        }
     }
 }
 
@@ -761,70 +816,76 @@ impl Drop for Renderer {
 }
 
 unsafe fn shader(kind: u32, source: &CStr) -> Result<u32, String> {
-    let shader = glCreateShader(kind);
+    let shader = unsafe { glCreateShader(kind) };
     if shader == 0 {
         return Err("could not allocate HDR shader".into());
     }
-    glShaderSource(shader, 1, &source.as_ptr(), ptr::null());
-    glCompileShader(shader);
+    let shader = DropGuard::new(shader, |shader| unsafe { glDeleteShader(shader) });
     let mut status = 0;
-    glGetShaderiv(shader, COMPILE_STATUS, &mut status);
+    unsafe {
+        glShaderSource(*shader, 1, &source.as_ptr(), ptr::null());
+        glCompileShader(*shader);
+        glGetShaderiv(*shader, COMPILE_STATUS, &mut status);
+    }
     if status == 0 {
         let mut log = [0_u8; 2048];
         let mut length = 0;
-        glGetShaderInfoLog(
-            shader,
-            log.len() as i32,
-            &mut length,
-            log.as_mut_ptr().cast(),
-        );
-        glDeleteShader(shader);
+        unsafe {
+            glGetShaderInfoLog(
+                *shader,
+                log.len() as i32,
+                &mut length,
+                log.as_mut_ptr().cast(),
+            )
+        };
         return Err(format!(
             "HDR shader compilation failed: {}",
             String::from_utf8_lossy(&log[..length.max(0) as usize])
         ));
     }
-    Ok(shader)
+    Ok(DropGuard::dismiss(shader))
 }
 
 unsafe fn program() -> Result<u32, String> {
-    let vertex = shader(VERTEX_SHADER, VERTEX_SOURCE)?;
-    let fragment = match shader(FRAGMENT_SHADER, FRAGMENT_SOURCE) {
-        Ok(fragment) => fragment,
-        Err(error) => {
-            glDeleteShader(vertex);
-            return Err(error);
-        }
-    };
-    let program = glCreateProgram();
+    let vertex = DropGuard::new(
+        unsafe { shader(VERTEX_SHADER, VERTEX_SOURCE) }?,
+        |shader| unsafe { glDeleteShader(shader) },
+    );
+    let fragment = DropGuard::new(
+        unsafe { shader(FRAGMENT_SHADER, FRAGMENT_SOURCE) }?,
+        |shader| unsafe { glDeleteShader(shader) },
+    );
+    let program = unsafe { glCreateProgram() };
     if program == 0 {
-        glDeleteShader(vertex);
-        glDeleteShader(fragment);
         return Err("could not allocate HDR shader program".into());
     }
-    glAttachShader(program, vertex);
-    glAttachShader(program, fragment);
-    glLinkProgram(program);
-    glDeleteShader(vertex);
-    glDeleteShader(fragment);
+    let program = DropGuard::new(program, |program| unsafe { glDeleteProgram(program) });
+    unsafe {
+        glAttachShader(*program, *vertex);
+        glAttachShader(*program, *fragment);
+        glLinkProgram(*program);
+    }
+    drop(vertex);
+    drop(fragment);
     let mut status = 0;
-    glGetProgramiv(program, LINK_STATUS, &mut status);
+    unsafe { glGetProgramiv(*program, LINK_STATUS, &mut status) };
     if status == 0 {
         let mut log = [0_u8; 2048];
         let mut length = 0;
-        glGetProgramInfoLog(
-            program,
-            log.len() as i32,
-            &mut length,
-            log.as_mut_ptr().cast(),
-        );
-        glDeleteProgram(program);
+        unsafe {
+            glGetProgramInfoLog(
+                *program,
+                log.len() as i32,
+                &mut length,
+                log.as_mut_ptr().cast(),
+            )
+        };
         return Err(format!(
             "HDR shader link failed: {}",
             String::from_utf8_lossy(&log[..length.max(0) as usize])
         ));
     }
-    Ok(program)
+    Ok(DropGuard::dismiss(program))
 }
 
 const VERTEX_SOURCE: &CStr = c"#version 120
