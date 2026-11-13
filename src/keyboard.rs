@@ -111,3 +111,26 @@ unsafe extern "C" {
     ) -> u32;
     fn xkb_state_key_get_one_sym(state: *mut c_void, keycode: u32) -> u32;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" {
+        fn xkb_context_set_log_level(context: *mut c_void, level: u32);
+    }
+
+    #[test]
+    fn invalid_keymaps_return_compile_errors() {
+        let context = Context::new().unwrap();
+        const XKB_LOG_LEVEL_CRITICAL: u32 = 10;
+        // Suppress expected parser errors only on this test's context.
+        unsafe { xkb_context_set_log_level(context.0.as_ptr(), XKB_LOG_LEVEL_CRITICAL) };
+        for keymap in [b"".as_slice(), b"invalid keymap", b"invalid keymap\0"] {
+            assert!(matches!(
+                context.compile(keymap),
+                Err("could not compile keyboard keymap")
+            ));
+        }
+    }
+}

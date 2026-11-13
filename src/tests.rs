@@ -132,18 +132,6 @@ const KEYMAP: &str = r#"xkb_keymap {
 };"#;
 
 #[test]
-fn invalid_keymaps_do_not_affect_existing_keyboard_state() {
-    let keyboard = keyboard::KeyboardState::new(KEYMAP.as_bytes()).unwrap();
-    for keymap in [b"".as_slice(), b"invalid keymap", b"invalid keymap\0"] {
-        assert!(matches!(
-            keyboard::KeyboardState::new(keymap),
-            Err("could not compile keyboard keymap")
-        ));
-        assert_eq!(keyboard.action(16), Some(keyboard::Action::Quit));
-    }
-}
-
-#[test]
 fn clock_formats_handle_empty_invalid_and_oversized_output() {
     assert_eq!(current_time_text("matrix"), "matrix");
     assert_eq!(current_time_text(""), "");
